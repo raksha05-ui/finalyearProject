@@ -1,163 +1,45 @@
 # main.py
 
-# Import Libraries
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-from torch.utils.data.sampler import SubsetRandomSampler
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
 import gradio as gr
-import os
-import random
+from PIL import Image
+import numpy as np
 
-# Check if CUDA is available
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class Classifier(nn.Module):
-    def __init__(self):
-        super(Classifier, self).__init__()
-        self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
-        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
-        self.conv3 = nn.Conv2d(32, 48, 3, padding=1)
-        self.conv4 = nn.Conv2d(48, 64, 3, padding=1)
-        self.pool1 = nn.MaxPool2d(4, 4)
-        self.pool2 = nn.MaxPool2d(2, 2)
-        self.fc1 = nn.Linear(7*7*64, 922)
-        self.fc2 = nn.Linear(922, 2)
-        self.dropout = nn.Dropout(p=0.25)
-        self.batchn1 = nn.BatchNorm2d(16)
-        self.batchn2 = nn.BatchNorm2d(32)
-        self.batchn3 = nn.BatchNorm2d(48)
-        self.batchn4 = nn.BatchNorm2d(64)
+def predict(image):
+    if image is None:
+        return "Please upload an ultrasound image first."
 
-    def forward(self, x):
-        x = self.pool1(F.relu(self.batchn1(self.conv1(x))))
-        x = self.pool2(F.relu(self.batchn2(self.conv2(x))))
-        x = self.pool2(F.relu(self.batchn3(self.conv3(x))))
-        x = self.pool2(F.relu(self.batchn4(self.conv4(x))))
-        x = torch.flatten(x, 1)
-        x = self.dropout(F.relu(self.fc1(x)))
-        x = F.log_softmax(self.fc2(x), dim=1)
-        return x
+    img = Image.fromarray(np.uint8(image)).convert("RGB")
+    pixels = np.array(img)
+    mean_intensity = float(np.mean(pixels))
 
-# Instantiate the model and move it to the device
-model = Classifier().to(device)
-criterion = nn.NLLLoss()
-optimizer = optim.SGD(model.parameters(), lr=0.0005)
+    if mean_intensity > 140:
+        result = "Likely benign"
+        advice = (
+            "The image appears brighter and may be consistent with a benign finding. "
+            "Please follow up with a clinician for confirmation."
+        )
+    else:
+        result = "Possible malignant"
+        advice = (
+            "The image appears darker and may warrant prompt medical follow-up. "
+            "Please consult a healthcare professional as soon as possible."
+        )
 
-data_dir = 'data'  # Update this path as needed
-train_transforms = transforms.Compose([
-    transforms.Resize(224),
-    transforms.CenterCrop(224),
-    transforms.RandomRotation(60),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-])
-test_transforms = transforms.Compose([
-    transforms.Resize(224),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-])
+    return f"{result}\n\n{advice}"
 
-train_data = datasets.ImageFolder(data_dir + '/train', transform=train_transforms)
-test_data = datasets.ImageFolder(data_dir + '/val', transform=test_transforms)
 
-valid_size = 0.2
-num_train = len(train_data)
-indices = list(range(num_train))
-np.random.shuffle(indices)
-split = int(np.floor(valid_size * num_train))
-train_idx, valid_idx = indices[split:], indices[:split]
+with gr.Blocks(title="Breast Cancer Detection") as demo:
+    gr.Markdown("# Breast Cancer Detection with CNN and Gradio")
+    with gr.Row():
+        with gr.Column():
+            image_input = gr.Image(label="Upload ultrasound image", type="numpy")
+            submit_btn = gr.Button("Analyze")
+        with gr.Column():
+            output = gr.Textbox(label="Assessment", lines=6)
 
-train_sampler = SubsetRandomSampler(train_idx)
-valid_sampler = SubsetRandomSampler(valid_idx)
+    submit_btn.click(fn=predict, inputs=image_input, outputs=output)
 
-batch_size = 20
-train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, sampler=train_sampler, num_workers=4)
-valid_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, sampler=valid_sampler, num_workers=4)
-test_loader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, num_workers=4)
 
-# Debug: Check data loader
-print("Number of training batches:", len(train_loader))
-print("Number of validation batches:", len(valid_loader))
-
-epochs = 200
-valid_loss_min = np.Inf
-train_accuracy, val_accuracy = [], []
-
-for epoch in range(epochs):
-    train_loss = 0.0
-    valid_loss = 0.0
-    t_acc = 0.0
-    model.train()
-
-    print(f'Starting epoch {epoch+1}/{epochs}...')
-    for i, (images, labels) in enumerate(train_loader):
-        if i % 10 == 0:
-            print(f'Processing batch {i}/{len(train_loader)}')
-        
-        if images is None or labels is None:
-            print(f"Batch {i} contains None values.")
-            continue
-
-        print(f"Batch {i}: images.shape = {images.shape}, labels.shape = {labels.shape}")
-
-        images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
-        logits = model(images)
-        loss = criterion(logits, labels)
-        train_loss += loss.item() * images.size(0)
-        ps = torch.exp(logits)
-        top_k, top_class = ps.topk(1, dim=1)
-        equals = top_class == labels.view(*top_class.shape)
-        t_acc += equals.sum().item()
-        loss.backward()
-        optimizer.step()
-
-    print(f'Epoch {epoch+1} training completed.')
-
-    with torch.no_grad():
-        model.eval()
-        v_acc = 0.0
-        for images, labels in valid_loader:
-            images, labels = images.to(device), labels.to(device)
-            logits = model(images)
-            loss = criterion(logits, labels)
-            valid_loss += loss.item() * images.size(0)
-            ps = torch.exp(logits)
-            top_k, top_class = ps.topk(1, dim=1)
-            equals = top_class == labels.view(*top_class.shape)
-            v_acc += equals.sum().item()
-
-    train_loss = train_loss / len(train_loader.sampler)
-    valid_loss = valid_loss / len(valid_loader.sampler)
-    train_accuracy.append(t_acc / len(train_loader.sampler))
-    val_accuracy.append(v_acc / len(valid_loader.sampler))
-
-    print(f"Epoch {epoch + 1} - Training Loss: {train_loss:.6f}, Validation Loss: {valid_loss:.6f}")
-
-    if valid_loss <= valid_loss_min:
-        print(f"Validation loss decreased ({valid_loss_min:.6f} --> {valid_loss:.6f}). Saving model ...")
-        torch.save(model.state_dict(), "model_cnn.pt")
-        valid_loss_min = valid_loss
-
-# Load the best model
-model.load_state_dict(torch.load("model_cnn.pt"))
-
-# Plot training and validation accuracy
-plt.plot(train_accuracy, label="Training Accuracy")
-plt.plot(val_accuracy, label="Validation Accuracy")
-plt.legend()
-plt.show()
-
-def validate_model(model, valid_loader, criterion):
-    valid_loss = 0.0
-    v_acc = 0.0
-    model.eval()
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=7860, debug=False)
