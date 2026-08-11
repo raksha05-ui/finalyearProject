@@ -134,7 +134,7 @@ def _preprocess_for_model(pil_img: Image.Image):
 
 
 def grad_cam(model: torch.nn.Module, input_tensor: torch.Tensor, target_layer=None, target_class=None):
-    """Compute Grad-CAM heatmap and return a PIL RGBA overlay."""
+    """Compute Grad-CAM heatmap and return a normalized 2D numpy array (H,W) in [0,1]."""
     device = next(model.parameters()).device
     model.to(device)
     input_tensor = input_tensor.to(device)
@@ -194,37 +194,46 @@ def grad_cam(model: torch.nn.Module, input_tensor: torch.Tensor, target_layer=No
     cam = cam.squeeze().cpu().numpy()
     cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
 
-    cmap = cm.get_cmap("jet")
-    colored = (cmap(cam)[:, :, :3] * 255).astype(np.uint8)
-    heat = Image.fromarray(colored).convert("RGBA")
-
-    return heat
+    return cam
 
 
-def predict(image: np.ndarray):
+def predict(image: np.ndarray, model: Optional[torch.nn.Module] = None):
     if image is None:
         return "", 0.0, None, None, None
 
     pil = Image.fromarray(np.uint8(image)).convert("RGB")
-    arr = np.asarray(pil)
-
-    mean_intensity = float(arr.mean())
-    std_intensity = float(arr.std())
-
-    score = max(0.0, min(1.0, (140 - mean_intensity) / 100.0 + std_intensity / 255.0))
-
-    if score < 0.35:
-        label = "Likely benign"
-    elif score < 0.65:
-        label = "Unclear — recommend follow-up"
-    else:
-        label = "Possible malignant — seek medical advice"
-
-    confidence = 1.0 - abs(0.5 - score) * 2.0
-    confidence = float(max(0.0, min(1.0, confidence)))
-
     hist_img = _make_hist_image(pil)
     saliency_overlay = _make_saliency_overlay(pil)
+
+    if model is not None:
+        try:
+            input_t = _preprocess_for_model(pil)
+            with torch.no_grad():
+                output = model(input_t)
+            if isinstance(output, tuple):
+                output = output[0]
+            probs = F.softmax(output, dim=1)
+            confidence, idx = probs.max(dim=1)
+            label = "Likely benign" if int(idx.item()) == 0 else "Possible malignant"
+            confidence = float(confidence.item())
+        except Exception:
+            model = None
+
+    if model is None:
+        arr = np.asarray(pil)
+        mean_intensity = float(arr.mean())
+        std_intensity = float(arr.std())
+
+        score = max(0.0, min(1.0, (140 - mean_intensity) / 100.0 + std_intensity / 255.0))
+        if score < 0.35:
+            label = "Likely benign"
+        elif score < 0.65:
+            label = "Unclear — recommend follow-up"
+        else:
+            label = "Possible malignant — seek medical advice"
+
+        confidence = 1.0 - abs(0.5 - score) * 2.0
+        confidence = float(max(0.0, min(1.0, confidence)))
 
     report = _make_report_text(label, confidence)
     fd, path = tempfile.mkstemp(suffix=".txt", prefix="report_")
@@ -240,19 +249,207 @@ EXAMPLES = []
 # try to load a user-provided model from disk (model_cnn.pt)
 user_model = load_user_model()
 
+css = """
+:root {
+  color-scheme: dark;
+  --bg: #07101d;
+  --surface: rgba(10, 18, 34, 0.96);
+  --surface-strong: rgba(15, 23, 42, 0.96);
+  --surface-muted: rgba(30, 41, 59, 0.95);
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --border: rgba(148, 163, 184, 0.18);
+  --accent: #60a5fa;
+  --accent-soft: rgba(96, 165, 250, 0.16);
+}
+html, body {
+  min-height: 100%;
+  margin: 0;
+  padding: 0;
+  background: radial-gradient(circle at top left, rgba(59, 130, 246, 0.16), transparent 24%),
+              radial-gradient(circle at bottom right, rgba(56, 189, 248, 0.12), transparent 20%),
+              var(--bg) !important;
+  color: var(--text) !important;
+}
+.gradio-container,
+.gradio-container > div,
+.gradio-container .gr-block,
+.gradio-container .gr-box,
+.gradio-container .gr-row,
+.gradio-container .gr-column,
+.gradio-container .gr-form,
+.gradio-container .gr-interface,
+.gradio-container .gr-tabs,
+.gradio-container .gr-panel,
+.gradio-container .gr-image,
+.gradio-container .gr-file,
+.gradio-container .gr-slider,
+.gradio-container .gr-dropdown,
+.gradio-container .gr-number,
+.gradio-container .gr-checkbox {
+  background: var(--surface) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--border) !important;
+}
+.gradio-container {
+  background: transparent !important;
+}
+.gradio-container .gr-box,
+.gradio-container .gr-row,
+.gradio-container .gr-column {
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.18) !important;
+}
+.header {
+  background: var(--surface-strong) !important;
+  border: 1px solid var(--border) !important;
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(22px);
+}
+.logo-box {
+  width: 56px;
+  height: 56px;
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #111827;
+  color: var(--text);
+  font-weight: 800;
+}
+.hero-title,
+.hero-sub,
+.small.muted,
+.gr-markdown,
+.gr-text,
+.gr-label,
+.gr-block-title,
+.gr-form,
+.gr-number,
+.gr-dropdown,
+.gr-slider,
+.gr-checkbox {
+  color: var(--text) !important;
+}
+.small.muted,
+.gr-markdown .muted {
+  color: var(--muted) !important;
+}
+.gr-button,
+.gr-button:hover,
+.gr-button:focus {
+  background: var(--accent) !important;
+  color: white !important;
+  border: none !important;
+}
+.gr-button {
+  box-shadow: 0 12px 28px rgba(59, 130, 246, 0.18) !important;
+}
+"""
 
-with gr.Blocks(title="Breast Screening Assistant") as demo:
+with gr.Blocks(title="Breast Screening Assistant", theme=gr.themes.Dark()) as demo:
     # Header / Hero
     with gr.Row(elem_id="top-row"):
         with gr.Column(scale=3):
             gr.HTML(
                 """
-                <div class="header">
+                <style>
+                :root {
+                  color-scheme: dark;
+                  --bg: #04101b;
+                  --surface: rgba(8, 14, 24, 0.96);
+                  --surface-strong: rgba(12, 18, 32, 0.96);
+                  --surface-muted: rgba(17, 25, 43, 0.98);
+                  --text: #f8fafc;
+                  --muted: #94a3b8;
+                  --border: rgba(148, 163, 184, 0.22);
+                  --accent: #60a5fa;
+                }
+                html, body {
+                  min-height: 100%;
+                  margin: 0;
+                  padding: 0;
+                  background: radial-gradient(circle at top left, rgba(96, 165, 250, 0.16), transparent 24%),
+                              radial-gradient(circle at bottom right, rgba(56, 189, 248, 0.12), transparent 20%),
+                              var(--bg) !important;
+                  color: var(--text) !important;
+                }
+                .gradio-container,
+                .gradio-container > div,
+                .gradio-container .gr-block,
+                .gradio-container .gr-box,
+                .gradio-container .gr-row,
+                .gradio-container .gr-column,
+                .gradio-container .gr-form,
+                .gradio-container .gr-interface,
+                .gradio-container .gr-tabs,
+                .gradio-container .gr-panel,
+                .gradio-container .gr-block-title,
+                .gradio-container .gr-markdown,
+                .gradio-container .gr-text,
+                .gradio-container .gr-label,
+                .gradio-container .gr-button,
+                .gradio-container .gr-number,
+                .gradio-container .gr-dropdown,
+                .gradio-container .gr-slider,
+                .gradio-container .gr-file,
+                .gradio-container .gr-image,
+                .gradio-container .gr-checkbox {
+                  color: var(--text) !important;
+                }
+                .gradio-container,
+                .gradio-container > div,
+                .gradio-container .gr-block,
+                .gradio-container .gr-box,
+                .gradio-container .gr-row,
+                .gradio-container .gr-column,
+                .gradio-container .gr-form,
+                .gradio-container .gr-interface,
+                .gradio-container .gr-tabs,
+                .gradio-container .gr-panel {
+                  background: var(--surface) !important;
+                  border: 1px solid var(--border) !important;
+                }
+                .gradio-container .gr-input,
+                .gradio-container .gr-button,
+                .gradio-container .gr-dropdown,
+                .gradio-container .gr-slider,
+                .gradio-container .gr-number,
+                .gradio-container .gr-file,
+                .gradio-container .gr-image,
+                .gradio-container .gr-checkbox {
+                  background: var(--surface-muted) !important;
+                  color: var(--text) !important;
+                  border-color: rgba(148, 163, 184, 0.14) !important;
+                }
+                .gradio-container .gr-button,
+                .gradio-container .gr-button:hover,
+                .gradio-container .gr-button:focus {
+                  background: var(--accent) !important;
+                  color: white !important;
+                  border: none !important;
+                }
+                .header {
+                  background: var(--surface-strong) !important;
+                  border: 1px solid var(--border) !important;
+                  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.28);
+                  backdrop-filter: blur(20px);
+                }
+                .logo-box {
+                  background: rgba(12, 18, 32, 0.96);
+                  color: var(--text);
+                }
+                .hero-sub,
+                .small.muted,
+                .gr-markdown .muted {
+                  color: var(--muted) !important;
+                }
+                </style>
+                <div class="header" style="padding: 22px; border-radius: 24px;">
                     <div style="display:flex;align-items:center;gap:16px;">
-                        <div style="width:56px;height:56px;border-radius:10px;background:white;display:flex;align-items:center;justify-content:center;color:#0f172a;font-weight:800">BC</div>
+                        <div class="logo-box">BC</div>
                         <div>
-                            <div class="hero-title">Breast Screening Assistant</div>
-                            <div class="hero-sub">Upload an ultrasound image and receive a clear screening summary and visual explanations.</div>
+                            <div class="hero-title" style="font-size:1.55rem; font-weight:800; letter-spacing:-0.02em;">Breast Screening Assistant</div>
+                            <div class="hero-sub" style="margin-top:4px;">Upload an ultrasound image and receive a clear screening summary and visual explanations.</div>
                         </div>
                     </div>
                 </div>
@@ -280,8 +477,12 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
                 with gr.Column(scale=2):
                     btn = gr.Button("Analyze", variant="primary", elem_classes="btn-primary")
                 with gr.Column(scale=1):
-                    use_gradcam = gr.Checkbox(label="Use Grad-CAM explanation (requires model_cnn.pt)", value=False)
-            gr.HTML("<div class='small muted'>Examples and sample images can be added here.</div>")
+                    model_file = gr.File(label="Optional model file (.pt)", file_types=[".pt"], type="filepath")
+                    use_gradcam = gr.Checkbox(label="Use Grad-CAM explanation", value=True)
+                    cmap_select = gr.Dropdown(label="Colormap", choices=["jet", "viridis", "plasma", "magma"], value="jet")
+                    threshold = gr.Slider(label="Threshold (hide low activations)", minimum=0.0, maximum=1.0, step=0.01, value=0.15)
+                    alpha = gr.Slider(label="Overlay alpha", minimum=0.0, maximum=1.0, step=0.05, value=0.5)
+            gr.HTML("<div class='small muted'>Upload model_cnn.pt to enable real CNN prediction and Grad-CAM explanation.</div>")
 
         # Right column: results
         with gr.Column(scale=1):
@@ -302,17 +503,47 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
     # Footer
     gr.HTML("<div style='text-align:center;margin-top:12px;color:#94a3b8;'>This demo is for exploration only — not a medical diagnosis.</div>")
 
-    def analyze_and_prepare(image, use_gradcam_flag=False):
-        label, confidence, hist_img, report_path, saliency_img = predict(image)
+    def analyze_and_prepare(image, model_file, use_gradcam_flag=True, cmap_name="jet", thresh=0.15, alpha_val=0.5):
+        active_model = user_model
+        if model_file is not None:
+            model_path = None
+            if isinstance(model_file, dict):
+                model_path = model_file.get("tmp_path") or model_file.get("name")
+            elif isinstance(model_file, str):
+                model_path = model_file
+            elif hasattr(model_file, "name"):
+                model_path = model_file.name
+
+            if model_path:
+                loaded_model = load_user_model(model_path)
+                if loaded_model is not None:
+                    active_model = loaded_model
+
+        label, confidence, hist_img, report_path, saliency_img = predict(image, active_model)
         # if the user requested Grad-CAM and a model is available, compute it
-        if use_gradcam_flag and user_model is not None and image is not None:
+        if use_gradcam_flag and active_model is not None and image is not None:
             try:
-                input_t = _preprocess_for_model(Image.fromarray(np.uint8(image)).convert("RGB"))
-                heat = grad_cam(user_model, input_t)
-                if heat is not None:
-                    orig = Image.fromarray(np.uint8(image)).convert("RGBA")
-                    blended = Image.blend(orig, heat.resize(orig.size), alpha=0.5)
-                    saliency_img = blended
+                pil_img = Image.fromarray(np.uint8(image)).convert("RGB")
+                input_t = _preprocess_for_model(pil_img)
+                cam = grad_cam(active_model, input_t)
+                if cam is not None:
+                    cmap = cm.get_cmap(cmap_name)
+                    colored = (cmap(cam)[:, :, :3] * 255).astype(np.uint8)
+                    heat = Image.fromarray(colored).convert("RGBA")
+                    if thresh is not None and thresh > 0.0:
+                        mask = (cam >= thresh).astype(np.uint8) * 255
+                        alpha_channel = Image.fromarray(mask).convert("L")
+                        heat.putalpha(alpha_channel)
+                    else:
+                        heat.putalpha(int(255 * alpha_val))
+
+                    heat = heat.resize(pil_img.size, resample=Image.BILINEAR)
+                    orig = pil_img.convert("RGBA")
+                    if thresh is not None and thresh > 0.0:
+                        saliency_img = Image.alpha_composite(orig, heat)
+                        saliency_img = Image.blend(orig, saliency_img, alpha=alpha_val)
+                    else:
+                        saliency_img = Image.blend(orig, heat, alpha=alpha_val)
             except Exception:
                 pass
         # `gr.Label` expects either a string or a mapping {label: score}.
@@ -338,7 +569,7 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
 
         return label_mapping, float(confidence), hist_img, saliency_img, report_path, last_text, recent_md
 
-    btn.click(fn=analyze_and_prepare, inputs=[image_input, use_gradcam], outputs=[label_out, conf_out, hist_out, saliency_out, download_report, last_analysis_out, recent_out])
+    btn.click(fn=analyze_and_prepare, inputs=[image_input, model_file, use_gradcam, cmap_select, threshold, alpha], outputs=[label_out, conf_out, hist_out, saliency_out, download_report, last_analysis_out, recent_out])
 
     def clear_history_fn():
         try:
