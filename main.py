@@ -5,6 +5,8 @@ import io
 import os
 import tempfile
 import json
+import csv
+from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
@@ -346,7 +348,7 @@ html, body {
 }
 """
 
-with gr.Blocks(title="Breast Screening Assistant", theme=gr.themes.Dark()) as demo:
+with gr.Blocks(title="Breast Screening Assistant") as demo:
     # Header / Hero
     with gr.Row(elem_id="top-row"):
         with gr.Column(scale=3):
@@ -468,11 +470,17 @@ with gr.Blocks(title="Breast Screening Assistant", theme=gr.themes.Dark()) as de
             last_analysis_out = gr.Markdown("**No analyses yet**")
             recent_out = gr.Markdown("No recent analyses")
             clear_history = gr.Button("Clear history")
+            gr.Markdown("---")
+            gr.Markdown("### Model")
+            model_info = gr.HTML("<div class='small muted'>No model loaded. Uses bundled `model_cnn.pt` if available.</div>")
+            refresh_model = gr.Button("Refresh model info")
+            load_model_btn = gr.Button("Load bundled model")
 
         # Main area: input and controls
         with gr.Column(scale=2):
             gr.Markdown("### Input")
             image_input = gr.Image(label="Upload ultrasound image", type="numpy")
+            show_quick_card = gr.Checkbox(label="Show quick assessment card", value=False)
             with gr.Row():
                 with gr.Column(scale=2):
                     btn = gr.Button("Analyze", variant="primary", elem_classes="btn-primary")
@@ -497,13 +505,15 @@ with gr.Blocks(title="Breast Screening Assistant", theme=gr.themes.Dark()) as de
             hist_out = gr.Image(label="Intensity histogram")
             gr.Markdown("#### Explanation")
             saliency_out = gr.Image(label="Explanation (saliency overlay)")
+            saliency_file = gr.File(label="Download saliency image")
             gr.Markdown("---")
             download_report = gr.File(label="Download report")
+            quick_card = gr.HTML()
 
     # Footer
     gr.HTML("<div style='text-align:center;margin-top:12px;color:#94a3b8;'>This demo is for exploration only — not a medical diagnosis.</div>")
 
-    def analyze_and_prepare(image, model_file, use_gradcam_flag=True, cmap_name="jet", thresh=0.15, alpha_val=0.5):
+    def analyze_and_prepare(image, model_file, use_gradcam_flag=True, cmap_name="jet", thresh=0.15, alpha_val=0.5, show_quick=True):
         active_model = user_model
         if model_file is not None:
             model_path = None
@@ -567,9 +577,30 @@ with gr.Blocks(title="Breast Screening Assistant", theme=gr.themes.Dark()) as de
             last_text = "**No analyses yet**"
             recent_md = "No recent analyses"
 
-        return label_mapping, float(confidence), hist_img, saliency_img, report_path, last_text, recent_md
+        # prepare quick assessment HTML (optional)
+        quick_html = ""
+        if show_quick:
+            quick_html = f"""
+            <div style='background:#ffffff; color:#0f172a; border-radius:14px; padding:16px; box-shadow:0 10px 30px rgba(15,23,42,0.08);'>
+              <h3 style='color:#0f172a;'>Quick assessment</h3>
+              <p style='color:#0f172a;'><strong>Signal score:</strong> {int(confidence*100)}/100</p>
+              <p style='color:#0f172a;'><strong>Result:</strong> {label}</p>
+            </div>
+            """
 
-    btn.click(fn=analyze_and_prepare, inputs=[image_input, model_file, use_gradcam, cmap_select, threshold, alpha], outputs=[label_out, conf_out, hist_out, saliency_out, download_report, last_analysis_out, recent_out])
+        # save saliency image for download if available
+        saliency_path = None
+        try:
+            if saliency_img is not None:
+                fd_s, saliency_path = tempfile.mkstemp(suffix='.png', prefix='saliency_')
+                os.close(fd_s)
+                saliency_img.convert('RGB').save(saliency_path, format='PNG')
+        except Exception:
+            saliency_path = None
+
+        return label_mapping, float(confidence), hist_img, saliency_img, report_path, last_text, recent_md, quick_html, saliency_path
+
+    btn.click(fn=analyze_and_prepare, inputs=[image_input, model_file, use_gradcam, cmap_select, threshold, alpha, show_quick_card], outputs=[label_out, conf_out, hist_out, saliency_out, download_report, last_analysis_out, recent_out, quick_card, saliency_file])
 
     def clear_history_fn():
         try:
@@ -581,6 +612,117 @@ with gr.Blocks(title="Breast Screening Assistant", theme=gr.themes.Dark()) as de
         return "**No analyses yet**", "No recent analyses"
 
     clear_history.click(fn=clear_history_fn, inputs=None, outputs=[last_analysis_out, recent_out])
+
+    def _format_model_info(path):
+        if not path or not os.path.exists(path):
+            return "<div class='small muted'>No model file found at <code>model_cnn.pt</code>.</div>"
+        try:
+            st = os.stat(path)
+            size_mb = st.st_size / (1024 * 1024)
+            mtime = datetime.utcfromtimestamp(st.st_mtime).isoformat() + 'Z'
+            return f"<div><strong>Model:</strong> {Path(path).name}<br><strong>Size:</strong> {size_mb:.2f} MB<br><strong>Modified:</strong> {mtime}</div>"
+        except Exception:
+            return "<div class='small muted'>Unable to read model metadata.</div>"
+
+    def refresh_model_info_fn(model_file):
+        # prefer uploaded model path if provided
+        model_path = None
+        if model_file is not None:
+            if isinstance(model_file, dict):
+                model_path = model_file.get("tmp_path") or model_file.get("name")
+            elif isinstance(model_file, str):
+                model_path = model_file
+            elif hasattr(model_file, "name"):
+                model_path = model_file.name
+
+        if model_path and os.path.exists(model_path):
+            return _format_model_info(model_path)
+        # fallback to bundled model
+        bundled = os.path.join(os.path.dirname(__file__), "model_cnn.pt")
+        return _format_model_info(bundled)
+
+    def load_bundled_model_fn():
+        global user_model
+        bundled = os.path.join(os.path.dirname(__file__), "model_cnn.pt")
+        loaded = load_user_model(bundled)
+        if loaded is not None:
+            user_model = loaded
+            return _format_model_info(bundled)
+        return "<div class='small muted'>Bundled `model_cnn.pt` not found or could not be loaded.</div>"
+
+    refresh_model.click(fn=refresh_model_info_fn, inputs=[model_file], outputs=[model_info])
+    load_model_btn.click(fn=load_bundled_model_fn, inputs=None, outputs=[model_info])
+
+    # Batch prediction and model info
+    gr.Markdown("### Batch predictions")
+    batch_files = gr.Files(label="Upload multiple images (optional)")
+    run_batch = gr.Button("Run batch predictions")
+    batch_csv = gr.File(label="Download batch CSV")
+
+    def batch_predict(files, model_file, use_gradcam_flag=True, cmap_name="jet", thresh=0.15, alpha_val=0.5):
+        if not files:
+            return None
+        rows = []
+        # try to load provided model or use user_model
+        active_model = user_model
+        if model_file is not None:
+            model_path = None
+            if isinstance(model_file, dict):
+                model_path = model_file.get("tmp_path") or model_file.get("name")
+            elif isinstance(model_file, str):
+                model_path = model_file
+            elif hasattr(model_file, "name"):
+                model_path = model_file.name
+
+            if model_path:
+                loaded_model = load_user_model(model_path)
+                if loaded_model is not None:
+                    active_model = loaded_model
+
+        for f in files:
+            try:
+                img = Image.open(f.name if hasattr(f, 'name') else f).convert('RGB')
+                label, confidence, hist_img, report_path, saliency = predict(np.array(img), active_model)
+                rows.append({"filename": Path(f.name).name if hasattr(f, 'name') else str(f), "label": label, "confidence": confidence})
+            except Exception:
+                rows.append({"filename": getattr(f, 'name', str(f)), "label": "error", "confidence": 0.0})
+
+        if not rows:
+            return None
+
+        fd, path = tempfile.mkstemp(suffix=".csv", prefix="batch_preds_")
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=["filename", "label", "confidence"])
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+
+        return path
+
+    run_batch.click(fn=batch_predict, inputs=[batch_files, model_file, use_gradcam, cmap_select, threshold, alpha], outputs=[batch_csv])
+
+    def export_history_fn():
+        rec_file = os.path.join(os.path.dirname(__file__), 'recent.json')
+        if not os.path.exists(rec_file):
+            return None
+        try:
+            with open(rec_file, 'r', encoding='utf-8') as fh:
+                recs = json.load(fh)
+        except Exception:
+            recs = []
+        if not recs:
+            return None
+        fd, path = tempfile.mkstemp(suffix='.csv', prefix='history_')
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=['time','label','confidence'])
+            writer.writeheader()
+            for r in recs:
+                writer.writerow(r)
+        return path
+
+    export_history = gr.Button('Download history CSV')
+    export_out = gr.File(label='History CSV')
+    export_history.click(fn=export_history_fn, inputs=None, outputs=[export_out])
 
 
 def find_free_port(start_port=7860, end_port=7880):
