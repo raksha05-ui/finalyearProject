@@ -14,6 +14,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from PIL import Image, ImageFilter
+import PIL.ImageDraw as ImageDraw
 
 import gradio as gr
 
@@ -25,20 +26,60 @@ import socket
 
 
 def _make_hist_image(img: Image.Image):
-    arr = np.asarray(img.convert("L")).ravel()
-    fig, ax = plt.subplots(figsize=(4, 2.2), constrained_layout=True)
-    ax.hist(arr, bins=32, color="#4c72b0")
-    ax.set_title("Pixel intensity distribution")
-    ax.set_xlabel("Intensity")
-    ax.set_ylabel("Count")
-    ax.tick_params(axis="x", labelsize=8)
-    ax.tick_params(axis="y", labelsize=8)
+    # Create a simple histogram image using NumPy and PIL (avoid ImageDraw issues).
+    gray = np.asarray(img.convert("L")).ravel()
+    counts, bin_edges = np.histogram(gray, bins=32, range=(0, 255))
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=100)
-    plt.close(fig)
-    buf.seek(0)
-    return Image.open(buf)
+    # Image size (w, h)
+    w, h = 400, 220
+    pad_left, pad_right, pad_top, pad_bottom = 40, 12, 18, 28
+    plot_w = w - pad_left - pad_right
+    plot_h = h - pad_top - pad_bottom
+
+    # Normalize counts to plot height
+    if counts.max() > 0:
+        norm = counts / counts.max()
+    else:
+        norm = counts * 0.0
+
+    # Prepare RGB background
+    bg_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    bg_rgb[:, :] = np.array([16, 24, 36], dtype=np.uint8)
+
+    # Draw axes (x and y) as light lines
+    axis_color = np.array([180, 190, 200], dtype=np.uint8)
+    y_axis_x = pad_left
+    x_axis_y = h - pad_bottom
+    if 0 <= y_axis_x < w:
+        bg_rgb[pad_top:x_axis_y, y_axis_x:y_axis_x+2] = axis_color
+    if 0 <= x_axis_y < h:
+        bg_rgb[x_axis_y:x_axis_y+2, pad_left:w-pad_right] = axis_color
+
+    # Draw bars
+    bar_w = max(1, plot_w // len(counts))
+    bar_color = np.array([76, 114, 176], dtype=np.uint8)
+    for i, v in enumerate(norm):
+        bx = pad_left + i * bar_w
+        by = pad_top + int((1.0 - v) * plot_h)
+        x0 = int(bx)
+        x1 = int(min(w - pad_right, bx + bar_w - 1))
+        y0 = int(by)
+        y1 = x_axis_y - 1
+        if x0 < x1 and y0 < y1:
+            bg_rgb[y0:y1, x0:x1] = bar_color
+
+    # Convert to PIL Image and attempt to add simple title using default font
+    im = Image.fromarray(bg_rgb)
+    try:
+        from PIL import ImageFont
+        from PIL import ImageDraw as _ID
+        draw = _ID.Draw(im)
+        font = ImageFont.load_default()
+        draw.text((pad_left, 4), "Pixel intensity distribution", fill=(226, 232, 240), font=font)
+    except Exception:
+        pass
+
+    return im
 
 
 def _make_saliency_overlay(img: Image.Image, alpha: float = 0.5):
@@ -200,49 +241,60 @@ def grad_cam(model: torch.nn.Module, input_tensor: torch.Tensor, target_layer=No
 
 
 def predict(image: np.ndarray, model: Optional[torch.nn.Module] = None):
-    if image is None:
-        return "", 0.0, None, None, None
+    try:
+        if image is None:
+            return "", 0.0, None, None, None
 
-    pil = Image.fromarray(np.uint8(image)).convert("RGB")
-    hist_img = _make_hist_image(pil)
-    saliency_overlay = _make_saliency_overlay(pil)
+        pil = Image.fromarray(np.uint8(image)).convert("RGB")
+        hist_img = _make_hist_image(pil)
+        saliency_overlay = _make_saliency_overlay(pil)
 
-    if model is not None:
+        if model is not None:
+            try:
+                input_t = _preprocess_for_model(pil)
+                with torch.no_grad():
+                    output = model(input_t)
+                if isinstance(output, tuple):
+                    output = output[0]
+                probs = F.softmax(output, dim=1)
+                confidence, idx = probs.max(dim=1)
+                label = "Likely benign" if int(idx.item()) == 0 else "Possible malignant"
+                confidence = float(confidence.item())
+            except Exception:
+                model = None
+
+        if model is None:
+            arr = np.asarray(pil)
+            mean_intensity = float(arr.mean())
+            std_intensity = float(arr.std())
+
+            score = max(0.0, min(1.0, (140 - mean_intensity) / 100.0 + std_intensity / 255.0))
+            if score < 0.35:
+                label = "Likely benign"
+            elif score < 0.65:
+                label = "Unclear — recommend follow-up"
+            else:
+                label = "Possible malignant — seek medical advice"
+
+            confidence = 1.0 - abs(0.5 - score) * 2.0
+            confidence = float(max(0.0, min(1.0, confidence)))
+
+        report = _make_report_text(label, confidence)
+        fd, path = tempfile.mkstemp(suffix=".txt", prefix="report_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(report)
+
+        return label, confidence, hist_img, path, saliency_overlay
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        # return safe fallbacks
         try:
-            input_t = _preprocess_for_model(pil)
-            with torch.no_grad():
-                output = model(input_t)
-            if isinstance(output, tuple):
-                output = output[0]
-            probs = F.softmax(output, dim=1)
-            confidence, idx = probs.max(dim=1)
-            label = "Likely benign" if int(idx.item()) == 0 else "Possible malignant"
-            confidence = float(confidence.item())
+            from PIL import Image as PILImage
+            fallback = PILImage.new('RGBA', (400, 220), (30, 30, 30, 255))
         except Exception:
-            model = None
-
-    if model is None:
-        arr = np.asarray(pil)
-        mean_intensity = float(arr.mean())
-        std_intensity = float(arr.std())
-
-        score = max(0.0, min(1.0, (140 - mean_intensity) / 100.0 + std_intensity / 255.0))
-        if score < 0.35:
-            label = "Likely benign"
-        elif score < 0.65:
-            label = "Unclear — recommend follow-up"
-        else:
-            label = "Possible malignant — seek medical advice"
-
-        confidence = 1.0 - abs(0.5 - score) * 2.0
-        confidence = float(max(0.0, min(1.0, confidence)))
-
-    report = _make_report_text(label, confidence)
-    fd, path = tempfile.mkstemp(suffix=".txt", prefix="report_")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(report)
-
-    return label, confidence, hist_img, path, saliency_overlay
+            fallback = None
+        return 'Error', 0.0, fallback, None, fallback
 
 
 EXAMPLES = []
@@ -514,22 +566,44 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
     gr.HTML("<div style='text-align:center;margin-top:12px;color:#94a3b8;'>This demo is for exploration only — not a medical diagnosis.</div>")
 
     def analyze_and_prepare(image, model_file, use_gradcam_flag=True, cmap_name="jet", thresh=0.15, alpha_val=0.5, show_quick=True):
-        active_model = user_model
-        if model_file is not None:
-            model_path = None
-            if isinstance(model_file, dict):
-                model_path = model_file.get("tmp_path") or model_file.get("name")
-            elif isinstance(model_file, str):
-                model_path = model_file
-            elif hasattr(model_file, "name"):
-                model_path = model_file.name
+        """Analyze an uploaded image and prepare outputs for the Gradio UI.
 
-            if model_path:
-                loaded_model = load_user_model(model_path)
-                if loaded_model is not None:
-                    active_model = loaded_model
+        Errors are caught and logged; a safe fallback is returned on failure.
+        """
+        # Default safe fallbacks
+        fallback_img = None
+        try:
+            from PIL import Image as PILImage
+            fallback_img = PILImage.new('RGBA', (400, 220), (30, 30, 30, 255))
+        except Exception:
+            fallback_img = None
 
-        label, confidence, hist_img, report_path, saliency_img = predict(image, active_model)
+        try:
+            active_model = user_model
+            if model_file is not None:
+                model_path = None
+                if isinstance(model_file, dict):
+                    model_path = model_file.get("tmp_path") or model_file.get("name")
+                elif isinstance(model_file, str):
+                    model_path = model_file
+                elif hasattr(model_file, "name"):
+                    model_path = model_file.name
+
+                if model_path:
+                    loaded_model = load_user_model(model_path)
+                    if loaded_model is not None:
+                        active_model = loaded_model
+
+            label, confidence, hist_img, report_path, saliency_img = predict(image, active_model)
+
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            label = 'Error'
+            confidence = 0.0
+            hist_img = fallback_img
+            report_path = None
+            saliency_img = fallback_img
         # if the user requested Grad-CAM and a model is available, compute it
         if use_gradcam_flag and active_model is not None and image is not None:
             try:
@@ -739,5 +813,5 @@ def find_free_port(start_port=7860, end_port=7880):
 if __name__ == "__main__":
     port = find_free_port(7860, 7880) or 7860
     print(f"Launching on port {port}")
-    demo.launch(server_name="0.0.0.0", server_port=port, debug=False)
+    demo.launch(server_name="0.0.0.0", server_port=port, debug=True)
 
