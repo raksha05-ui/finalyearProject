@@ -552,6 +552,8 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
                     label_out = gr.Label(label="Assessment")
                 with gr.Column(scale=1):
                     conf_out = gr.Number(label="Confidence (0–1)")
+                with gr.Column(scale=1):
+                    diag_out = gr.Textbox(label="Cancer likelihood", interactive=False)
             gr.Markdown("---")
             gr.Markdown("#### Intensity histogram")
             hist_out = gr.Image(label="Intensity histogram")
@@ -633,6 +635,28 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
         # `gr.Label` expects either a string or a mapping {label: score}.
         label_mapping = {label: float(confidence)}
 
+        # Derive a simple diagnosis string for the UI
+        try:
+            lbl = (label or "").lower()
+            if "malignant" in lbl:
+                if confidence >= 0.6:
+                    diagnosis = "Likely cancer: YES"
+                elif confidence >= 0.4:
+                    diagnosis = "Possible cancer — follow-up recommended"
+                else:
+                    diagnosis = "Unclear — follow-up recommended"
+            elif "benign" in lbl:
+                if confidence >= 0.6:
+                    diagnosis = "Likely cancer: NO"
+                elif confidence >= 0.4:
+                    diagnosis = "Probably not cancer — consider follow-up"
+                else:
+                    diagnosis = "Unclear — follow-up recommended"
+            else:
+                diagnosis = "Unclear — follow-up recommended"
+        except Exception:
+            diagnosis = "Unclear"
+
         # update recent history (store in simple JSON)
         try:
             rec_file = os.path.join(os.path.dirname(__file__), 'recent.json')
@@ -672,9 +696,9 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
         except Exception:
             saliency_path = None
 
-        return label_mapping, float(confidence), hist_img, saliency_img, report_path, last_text, recent_md, quick_html, saliency_path
+        return label_mapping, float(confidence), diagnosis, hist_img, saliency_img, report_path, last_text, recent_md, quick_html, saliency_path
 
-    btn.click(fn=analyze_and_prepare, inputs=[image_input, model_file, use_gradcam, cmap_select, threshold, alpha, show_quick_card], outputs=[label_out, conf_out, hist_out, saliency_out, download_report, last_analysis_out, recent_out, quick_card, saliency_file])
+    btn.click(fn=analyze_and_prepare, inputs=[image_input, model_file, use_gradcam, cmap_select, threshold, alpha, show_quick_card], outputs=[label_out, conf_out, diag_out, hist_out, saliency_out, download_report, last_analysis_out, recent_out, quick_card, saliency_file])
 
     def clear_history_fn():
         try:
