@@ -522,6 +522,8 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
             last_analysis_out = gr.Markdown("**No analyses yet**")
             recent_out = gr.Markdown("No recent analyses")
             clear_history = gr.Button("Clear history")
+            save_result = gr.Button("Save result")
+            save_csv = gr.File(label="Saved CSV")
             gr.Markdown("---")
             gr.Markdown("### Model")
             model_info = gr.HTML("<div class='small muted'>No model loaded. Uses bundled `model_cnn.pt` if available.</div>")
@@ -536,6 +538,9 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
             with gr.Row():
                 with gr.Column(scale=2):
                     btn = gr.Button("Analyze", variant="primary", elem_classes="btn-primary")
+                    notebook_analyze_btn = gr.Button("Notebook Analyze")
+                    notebook_hist_btn = gr.Button("Notebook Histogram")
+                    notebook_saliency_btn = gr.Button("Notebook Saliency")
                 with gr.Column(scale=1):
                     model_file = gr.File(label="Optional model file (.pt)", file_types=[".pt"], type="filepath")
                     use_gradcam = gr.Checkbox(label="Use Grad-CAM explanation", value=True)
@@ -552,6 +557,8 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
                     label_out = gr.Label(label="Assessment")
                 with gr.Column(scale=1):
                     conf_out = gr.Number(label="Confidence (0–1)")
+                with gr.Column(scale=1):
+                    conf_badge = gr.HTML()
                 with gr.Column(scale=1):
                     diag_out = gr.Textbox(label="Cancer likelihood", interactive=False)
             gr.Markdown("---")
@@ -606,6 +613,51 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
             hist_img = fallback_img
             report_path = None
             saliency_img = fallback_img
+
+        # compute human-friendly diagnosis
+        try:
+            lbl = (label or "").lower()
+            c = float(confidence)
+            if "malignant" in lbl:
+                if c >= 0.6:
+                    diagnosis = "Likely cancer: YES"
+                elif c >= 0.4:
+                    diagnosis = "Possible cancer — follow-up recommended"
+                else:
+                    diagnosis = "Unclear — follow-up recommended"
+            elif "benign" in lbl:
+                if c >= 0.6:
+                    diagnosis = "Likely cancer: NO"
+                elif c >= 0.4:
+                    diagnosis = "Probably not cancer — consider follow-up"
+                else:
+                    diagnosis = "Unclear — follow-up recommended"
+        except Exception:
+            diagnosis = "Unclear"
+
+        # confidence badge HTML
+        try:
+            c = float(confidence)
+            if c >= 0.6:
+                color = '#16a34a'  # green
+                text = 'LOW'
+            elif c >= 0.4:
+                color = '#f59e0b'  # amber
+                text = 'MED'
+            else:
+                color = '#ef4444'  # red
+                text = 'HIGH'
+            conf_badge_html = f"<div style='display:inline-block;padding:6px 10px;border-radius:12px;background:{color};color:#fff;font-weight:700'>{text}</div>"
+        except Exception:
+            conf_badge_html = ""
+
+        # append diagnosis to report file if present
+        try:
+            if report_path and os.path.exists(report_path):
+                with open(report_path, 'a', encoding='utf-8') as fh:
+                    fh.write('\nDiagnosis: ' + (diagnosis or '') + '\n')
+        except Exception:
+            pass
         # if the user requested Grad-CAM and a model is available, compute it
         if use_gradcam_flag and active_model is not None and image is not None:
             try:
@@ -696,9 +748,133 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
         except Exception:
             saliency_path = None
 
-        return label_mapping, float(confidence), diagnosis, hist_img, saliency_img, report_path, last_text, recent_md, quick_html, saliency_path
+        return label_mapping, float(confidence), conf_badge_html, diagnosis, hist_img, saliency_img, report_path, last_text, recent_md, quick_html, saliency_path
 
-    btn.click(fn=analyze_and_prepare, inputs=[image_input, model_file, use_gradcam, cmap_select, threshold, alpha, show_quick_card], outputs=[label_out, conf_out, diag_out, hist_out, saliency_out, download_report, last_analysis_out, recent_out, quick_card, saliency_file])
+    btn.click(fn=analyze_and_prepare, inputs=[image_input, model_file, use_gradcam, cmap_select, threshold, alpha, show_quick_card], outputs=[label_out, conf_out, conf_badge, diag_out, hist_out, saliency_out, download_report, last_analysis_out, recent_out, quick_card, saliency_file])
+
+    # --- Notebook helper functions (from the enhanced notebook) ---
+    def _notebook_analyze_image(path_or_array):
+        # returns dict with label and score
+        if isinstance(path_or_array, str):
+            img = Image.open(path_or_array).convert('RGB')
+        else:
+            img = Image.fromarray(np.uint8(path_or_array)).convert('RGB')
+        arr = np.asarray(img)
+        mean = float(arr.mean())
+        std = float(arr.std())
+        score = max(0.0, min(1.0, (140 - mean) / 100.0 + std / 255.0))
+        if score < 0.35:
+            label = 'Likely benign'
+        elif score < 0.65:
+            label = 'Unclear — recommend follow-up'
+        else:
+            label = 'Possible malignant'
+        return {'label': label, 'score': float(score), 'mean': mean, 'std': std, 'pil': img}
+
+    def _notebook_saliency_overlay(path_or_array, alpha=0.5):
+        if isinstance(path_or_array, str):
+            img = Image.open(path_or_array).convert('RGB')
+        else:
+            img = Image.fromarray(np.uint8(path_or_array)).convert('RGB')
+        gray = np.asarray(img.convert('L'), dtype=np.float32)
+        gx = np.zeros_like(gray)
+        gy = np.zeros_like(gray)
+        gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
+        gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
+        mag = np.sqrt(gx ** 2 + gy ** 2)
+        if mag.max() > 0:
+            mag = (mag - mag.min()) / (mag.max() - mag.min())
+        else:
+            mag = mag * 0.0
+        mag_img = Image.fromarray((mag * 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(radius=2))
+        cmap = plt.get_cmap('jet')
+        mag_arr = np.asarray(mag_img) / 255.0
+        colored = (cmap(mag_arr)[:, :, :3] * 255).astype(np.uint8)
+        colored_img = Image.fromarray(colored).convert('RGBA')
+        blended = Image.blend(img.convert('RGBA'), colored_img, alpha=alpha)
+        return blended
+
+    def notebook_analyze_callback(image):
+        if image is None:
+            return { '': 0 }, 0.0, '', 'No image', None, None, None, "**No analyses yet**", "No recent analyses", "", None
+        info = _notebook_analyze_image(image)
+        label = info['label']
+        confidence = float(info['score'])
+        pil_img = info['pil']
+        # create hist and saliency using existing helpers
+        hist_img = _make_hist_image(pil_img)
+        saliency_img = _notebook_saliency_overlay(pil_img, alpha=0.5)
+        # build mapping and diagnosis
+        label_mapping = {label: confidence}
+        try:
+            if confidence >= 0.6:
+                conf_badge_html = "<div style='display:inline-block;padding:6px 10px;border-radius:12px;background:#16a34a;color:#fff;font-weight:700'>LOW</div>"
+            elif confidence >= 0.4:
+                conf_badge_html = "<div style='display:inline-block;padding:6px 10px;border-radius:12px;background:#f59e0b;color:#fff;font-weight:700'>MED</div>"
+            else:
+                conf_badge_html = "<div style='display:inline-block;padding:6px 10px;border-radius:12px;background:#ef4444;color:#fff;font-weight:700'>HIGH</div>"
+        except Exception:
+            conf_badge_html = ''
+        # diagnosis text
+        if 'malignant' in label.lower():
+            diagnosis = 'Possible cancer — follow-up recommended' if confidence < 0.6 else 'Likely cancer: YES'
+        elif 'benign' in label.lower():
+            diagnosis = 'Likely cancer: NO' if confidence >= 0.6 else 'Probably not cancer — consider follow-up'
+        else:
+            diagnosis = 'Unclear — follow-up recommended'
+        # write report
+        try:
+            report = _make_report_text(label, confidence)
+            fd, path = tempfile.mkstemp(suffix='.txt', prefix='report_')
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(report + '\nDiagnosis: ' + diagnosis + '\n')
+        except Exception:
+            path = None
+        # update recent
+        try:
+            rec_file = os.path.join(os.path.dirname(__file__), 'recent.json')
+            recs = []
+            if os.path.exists(rec_file):
+                with open(rec_file, 'r', encoding='utf-8') as fh:
+                    recs = json.load(fh)
+            entry = { 'time': datetime.utcnow().isoformat() + 'Z', 'label': label, 'confidence': float(confidence) }
+            recs.insert(0, entry)
+            recs = recs[:8]
+            with open(rec_file, 'w', encoding='utf-8') as fh:
+                json.dump(recs, fh)
+            last_text = f"**Last:** {entry['time']} — {entry['label']} ({entry['confidence']*100:.1f}%)"
+            recent_md = "\n\n".join([f"- {r['time']}: **{r['label']}** ({r['confidence']*100:.1f}%)" for r in recs])
+        except Exception:
+            last_text = "**No analyses yet**"
+            recent_md = "No recent analyses"
+
+        # save saliency image for download
+        saliency_path = None
+        try:
+            if saliency_img is not None:
+                fd_s, saliency_path = tempfile.mkstemp(suffix='.png', prefix='saliency_')
+                os.close(fd_s)
+                saliency_img.convert('RGB').save(saliency_path, format='PNG')
+        except Exception:
+            saliency_path = None
+
+        return label_mapping, float(confidence), conf_badge_html, diagnosis, hist_img, saliency_img, path, last_text, recent_md, "", saliency_path
+
+    def notebook_hist_callback(image):
+        if image is None:
+            return None
+        pil = Image.fromarray(np.uint8(image)).convert('RGB')
+        return _make_hist_image(pil)
+
+    def notebook_saliency_callback(image):
+        if image is None:
+            return None
+        pil = Image.fromarray(np.uint8(image)).convert('RGB')
+        return _notebook_saliency_overlay(pil, alpha=0.5)
+
+    notebook_analyze_btn.click(fn=notebook_analyze_callback, inputs=[image_input], outputs=[label_out, conf_out, conf_badge, diag_out, hist_out, saliency_out, download_report, last_analysis_out, recent_out, quick_card, saliency_file])
+    notebook_hist_btn.click(fn=notebook_hist_callback, inputs=[image_input], outputs=[hist_out])
+    notebook_saliency_btn.click(fn=notebook_saliency_callback, inputs=[image_input], outputs=[saliency_out])
 
     def clear_history_fn():
         try:
@@ -821,6 +997,48 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
     export_history = gr.Button('Download history CSV')
     export_out = gr.File(label='History CSV')
     export_history.click(fn=export_history_fn, inputs=None, outputs=[export_out])
+
+    def save_result_fn(label_map, confidence, diagnosis):
+        # label_map is a mapping {label: score}
+        try:
+            label = next(iter(label_map.keys())) if label_map else (diagnosis or 'unknown')
+        except Exception:
+            label = diagnosis or 'unknown'
+        try:
+            rec_file = os.path.join(os.path.dirname(__file__), 'recent.json')
+            recs = []
+            if os.path.exists(rec_file):
+                with open(rec_file, 'r', encoding='utf-8') as fh:
+                    recs = json.load(fh)
+        except Exception:
+            recs = []
+
+        entry = { 'time': datetime.utcnow().isoformat() + 'Z', 'label': label, 'confidence': float(confidence), 'diagnosis': diagnosis }
+        recs.insert(0, entry)
+        recs = recs[:64]
+        try:
+            with open(rec_file, 'w', encoding='utf-8') as fh:
+                json.dump(recs, fh)
+        except Exception:
+            pass
+
+        # write CSV
+        try:
+            fd, path = tempfile.mkstemp(suffix='.csv', prefix='saved_results_')
+            with os.fdopen(fd, 'w', encoding='utf-8', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=['time','label','confidence','diagnosis'])
+                writer.writeheader()
+                for r in recs:
+                    writer.writerow({'time': r.get('time'), 'label': r.get('label'), 'confidence': r.get('confidence'), 'diagnosis': r.get('diagnosis', '')})
+        except Exception:
+            path = None
+
+        # return updated UI snippets and file
+        last_text = f"**Last:** {entry['time']} — {entry['label']} ({entry['confidence']*100:.1f}%)"
+        recent_md = "\n\n".join([f"- {r['time']}: **{r['label']}** ({r['confidence']*100:.1f}%)" for r in recs])
+        return last_text, recent_md, path
+
+    save_result.click(fn=save_result_fn, inputs=[label_out, conf_out, diag_out], outputs=[last_analysis_out, recent_out, save_csv])
 
 
 def find_free_port(start_port=7860, end_port=7880):
