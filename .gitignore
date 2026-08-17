@@ -1,7 +1,4 @@
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.env
 model_cnn.pt
+server.log
+authors.txt
 tools/
