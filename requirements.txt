@@ -1,8 +1,6 @@
 gradio==6.22.0
 torch
 torchvision
-torchaudio
 numpy
 pillow
 matplotlib
-scikit-learn
