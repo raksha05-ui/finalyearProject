@@ -282,11 +282,19 @@ def make_report_text(verdict: str, label: str, confidence: float,
 # Core prediction
 # ---------------------------------------------------------------------------
 
-MODEL = load_bundled_model()
+MODEL = None
+
+
+def get_model() -> Optional[torch.nn.Module]:
+    global MODEL
+    if MODEL is None and os.path.exists("model_cnn.pt"):
+        MODEL = load_bundled_model()
+    return MODEL
 
 
 def predict(image: np.ndarray, use_explanation: bool):
     pil = Image.fromarray(np.uint8(image)).convert("RGB")
+    model = get_model()
 
     # Out-of-distribution / quality gate runs first — a CNN will produce a
     # confident-looking number for literally any input, so we check whether
@@ -311,19 +319,19 @@ def predict(image: np.ndarray, use_explanation: bool):
             f.write(report)
         return "REJECTED", quality_reason, None, hist_img, None, report_path, None, ""
 
-    if MODEL is not None:
+    if model is not None:
         try:
             input_t = _preprocess_for_model(pil)
             # Keep MC-dropout lightweight for deployed environments; explanations
             # are optional and should not run by default.
-            mean_probs, std_probs = mc_dropout_predict(MODEL, input_t, n_passes=5)
+            mean_probs, std_probs = mc_dropout_predict(model, input_t, n_passes=5)
             idx_t = int(mean_probs.argmax().item())
             label = "Benign" if idx_t == 0 else "Malignant"
             confidence = float(mean_probs[idx_t].item())
             uncertainty = float(std_probs[idx_t].item())
 
             if use_explanation:
-                cam = grad_cam(MODEL, input_t)
+                cam = grad_cam(model, input_t)
                 if cam is not None:
                     explanation_img = gradcam_overlay(pil, cam)
         except Exception:
@@ -487,7 +495,7 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
             analyze_btn = gr.Button("Analyze", variant="primary")
             model_status = (
                 "Using trained CNN model (model_cnn.pt)."
-                if MODEL is not None
+                if os.path.exists("model_cnn.pt")
                 else "No trained model found — using a basic image heuristic instead. "
                      "Add model_cnn.pt next to main.py for real predictions."
             )
