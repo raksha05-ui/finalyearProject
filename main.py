@@ -178,13 +178,12 @@ def grad_cam(model: torch.nn.Module, input_tensor: torch.Tensor):
     return cam
 
 
-def mc_dropout_predict(model: torch.nn.Module, input_tensor: torch.Tensor, n_passes: int = 20):
-    """Run several stochastic forward passes with dropout active (but
-    BatchNorm frozen in eval mode) to estimate predictive uncertainty.
+def mc_dropout_predict(model: torch.nn.Module, input_tensor: torch.Tensor, n_passes: int = 5):
+    """Run a small number of stochastic forward passes to estimate uncertainty.
 
-    A single forward pass gives one confident-looking number even when the
-    model is actually unsure. Averaging over many dropout masks reveals how
-    much the prediction wobbles — that spread is the uncertainty estimate.
+    For deployed deployments, 20 passes is expensive and usually unnecessary.
+    A lighter default keeps the app responsive while still providing a useful
+    uncertainty estimate.
     """
     was_training = model.training
     model.eval()
@@ -315,7 +314,9 @@ def predict(image: np.ndarray, use_explanation: bool):
     if MODEL is not None:
         try:
             input_t = _preprocess_for_model(pil)
-            mean_probs, std_probs = mc_dropout_predict(MODEL, input_t, n_passes=20)
+            # Keep MC-dropout lightweight for deployed environments; explanations
+            # are optional and should not run by default.
+            mean_probs, std_probs = mc_dropout_predict(MODEL, input_t, n_passes=5)
             idx_t = int(mean_probs.argmax().item())
             label = "Benign" if idx_t == 0 else "Malignant"
             confidence = float(mean_probs[idx_t].item())
@@ -482,7 +483,7 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
     with gr.Row():
         with gr.Column(scale=1):
             image_input = gr.Image(label="Ultrasound image", type="numpy")
-            show_explanation = gr.Checkbox(label="Show visual explanation (highlighted regions)", value=True)
+            show_explanation = gr.Checkbox(label="Show visual explanation (highlighted regions)", value=False)
             analyze_btn = gr.Button("Analyze", variant="primary")
             model_status = (
                 "Using trained CNN model (model_cnn.pt)."
