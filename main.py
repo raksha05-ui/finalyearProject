@@ -65,6 +65,47 @@ class Classifier(torch.nn.Module):
         return x
 
 
+def check_image_quality(img: Image.Image):
+    """Heuristic out-of-distribution / sanity gate.
+
+    Real ultrasound frames are near-grayscale, have moderate contrast, and
+    contain actual spatial structure (not flat color, not pure noise).
+    This rejects/flags inputs the model was never meant to see, since the
+    CNN itself will otherwise emit a confident-looking answer for anything.
+    Returns (is_ok: bool, reason: str, is_warning_only: bool).
+    """
+    arr = np.asarray(img.convert("RGB"), dtype=np.float32)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+
+    # 1. Colorfulness check — ultrasound frames are essentially grayscale.
+    channel_spread = float(np.mean(np.abs(r - g)) + np.mean(np.abs(g - b)) + np.mean(np.abs(r - b)))
+    if channel_spread > 18.0:
+        return False, "This doesn't look like a grayscale ultrasound image (too much color).", False
+
+    gray = np.asarray(img.convert("L"), dtype=np.float32)
+
+    # 2. Flat-image check (solid color / near-blank frame).
+    std_i = float(gray.std())
+    if std_i < 8.0:
+        return False, "The image has almost no contrast/detail — doesn't look like a scan.", False
+
+    # 3. Pure-noise check — real tissue has spatial structure, so a small
+    #    Gaussian blur should noticeably reduce local variance. Uncorrelated
+    #    noise barely changes when blurred.
+    blurred = np.asarray(img.convert("L").filter(ImageFilter.GaussianBlur(radius=2)), dtype=np.float32)
+    local_var_orig = float(np.var(gray))
+    local_var_blur = float(np.var(blurred))
+    noise_ratio = local_var_blur / (local_var_orig + 1e-6)
+    if noise_ratio > 0.97:
+        return False, "The image looks like random noise rather than a real scan.", False
+
+    # 4. Soft warning zone — passes, but flag borderline cases for the user.
+    if std_i < 20.0 or noise_ratio > 0.92:
+        return True, "Image quality is borderline — result may be less reliable.", True
+
+    return True, "", False
+
+
 def load_bundled_model(path: str = "model_cnn.pt") -> Optional[torch.nn.Module]:
     if not os.path.exists(path):
         return None
@@ -137,6 +178,34 @@ def grad_cam(model: torch.nn.Module, input_tensor: torch.Tensor):
     return cam
 
 
+def mc_dropout_predict(model: torch.nn.Module, input_tensor: torch.Tensor, n_passes: int = 20):
+    """Run several stochastic forward passes with dropout active (but
+    BatchNorm frozen in eval mode) to estimate predictive uncertainty.
+
+    A single forward pass gives one confident-looking number even when the
+    model is actually unsure. Averaging over many dropout masks reveals how
+    much the prediction wobbles — that spread is the uncertainty estimate.
+    """
+    was_training = model.training
+    model.eval()
+    for module in model.modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.train()  # re-enable only dropout, BN stays frozen in eval
+
+    probs_list = []
+    with torch.no_grad():
+        for _ in range(n_passes):
+            out = model(input_tensor)
+            probs_list.append(torch.exp(out))
+
+    model.train(was_training)
+
+    probs_stack = torch.stack(probs_list, dim=0)  # (n_passes, 1, 2)
+    mean_probs = probs_stack.mean(dim=0).squeeze(0)
+    std_probs = probs_stack.std(dim=0).squeeze(0)
+    return mean_probs, std_probs
+
+
 # ---------------------------------------------------------------------------
 # Visualization helpers
 # ---------------------------------------------------------------------------
@@ -185,14 +254,26 @@ def gradcam_overlay(img: Image.Image, cam: np.ndarray, alpha: float = 0.5):
     return Image.blend(img.convert("RGBA"), heat, alpha=alpha)
 
 
-def make_report_text(verdict: str, label: str, confidence: float) -> str:
+def make_report_text(verdict: str, label: str, confidence: float,
+                      uncertainty: Optional[float] = None,
+                      quality_note: str = "") -> str:
     now = datetime.now(timezone.utc).isoformat()
+    uncertainty_line = ""
+    if uncertainty is not None:
+        reliability = "Low" if uncertainty > 0.15 else ("Medium" if uncertainty > 0.05 else "High")
+        uncertainty_line = (
+            f"Prediction uncertainty (MC-Dropout std): {uncertainty:.3f}\n"
+            f"Estimated reliability: {reliability}\n\n"
+        )
+    quality_line = f"Image quality note: {quality_note}\n\n" if quality_note else ""
     return (
         "Breast Cancer Screening Report\n"
         f"Generated: {now}\n\n"
         f"Verdict: {verdict}\n"
         f"Model output: {label}\n"
         f"Confidence: {confidence * 100:.1f}%\n\n"
+        f"{uncertainty_line}"
+        f"{quality_line}"
         "Note: This is an automated screening aid, not a medical diagnosis.\n"
         "Please consult a qualified physician for any medical decision."
     )
@@ -208,18 +289,37 @@ MODEL = load_bundled_model()
 def predict(image: np.ndarray, use_explanation: bool):
     pil = Image.fromarray(np.uint8(image)).convert("RGB")
 
-    label, confidence = None, None
+    # Out-of-distribution / quality gate runs first — a CNN will produce a
+    # confident-looking number for literally any input, so we check whether
+    # the input even resembles an ultrasound frame before trusting it.
+    is_ok, quality_reason, is_warning_only = check_image_quality(pil)
+
+    label, confidence, uncertainty = None, None, None
     explanation_img = None
+
+    if not is_ok:
+        # Reject outright: don't run the model, don't fabricate a verdict.
+        hist_img = make_histogram(pil)
+        report = (
+            "Breast Cancer Screening Report\n"
+            f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n"
+            "Verdict: REJECTED — input does not resemble an ultrasound scan\n"
+            f"Reason: {quality_reason}\n\n"
+            "No prediction was made. Please upload a genuine ultrasound image."
+        )
+        fd, report_path = tempfile.mkstemp(suffix=".txt", prefix="report_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(report)
+        return "REJECTED", quality_reason, None, hist_img, None, report_path, None, ""
 
     if MODEL is not None:
         try:
             input_t = _preprocess_for_model(pil)
-            with torch.no_grad():
-                output = MODEL(input_t)
-            probs = F.softmax(output, dim=1)
-            conf_t, idx_t = probs.max(dim=1)
-            label = "Benign" if int(idx_t.item()) == 0 else "Malignant"
-            confidence = float(conf_t.item())
+            mean_probs, std_probs = mc_dropout_predict(MODEL, input_t, n_passes=20)
+            idx_t = int(mean_probs.argmax().item())
+            label = "Benign" if idx_t == 0 else "Malignant"
+            confidence = float(mean_probs[idx_t].item())
+            uncertainty = float(std_probs[idx_t].item())
 
             if use_explanation:
                 cam = grad_cam(MODEL, input_t)
@@ -235,19 +335,21 @@ def predict(image: np.ndarray, use_explanation: bool):
         score = max(0.0, min(1.0, (140 - mean_i) / 100.0 + std_i / 255.0))
         label = "Malignant" if score >= 0.5 else "Benign"
         confidence = float(max(0.5, min(0.99, 0.5 + abs(score - 0.5))))
+        uncertainty = None
 
     if use_explanation and explanation_img is None:
         explanation_img = edge_saliency_overlay(pil)
 
     verdict = "Cancer likely" if label == "Malignant" else "Cancer unlikely"
     hist_img = make_histogram(pil)
-    report = make_report_text(verdict, label, confidence)
+    report = make_report_text(verdict, label, confidence, uncertainty,
+                               quality_reason if is_warning_only else "")
 
     fd, report_path = tempfile.mkstemp(suffix=".txt", prefix="report_")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(report)
 
-    return verdict, label, confidence, hist_img, explanation_img, report_path
+    return verdict, label, confidence, hist_img, explanation_img, report_path, uncertainty, (quality_reason if is_warning_only else "")
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +407,9 @@ def analyze(image, show_explanation):
         )
 
     try:
-        verdict, label, confidence, hist_img, explanation_img, report_path = predict(image, show_explanation)
+        verdict, label, confidence, hist_img, explanation_img, report_path, uncertainty, quality_warning = predict(
+            image, show_explanation
+        )
     except Exception as e:
         # Catch anything unexpected so the UI shows a readable message
         # instead of every panel breaking into a generic "Error" state.
@@ -319,11 +423,39 @@ def analyze(image, show_explanation):
         """
         return error_html, None, None, None, None
 
+    if verdict == "REJECTED":
+        verdict_html = f"""
+        <div class="verdict-card" style="background:#334155;">
+          <div class="verdict-title">Image rejected</div>
+          <div class="verdict-sub">{label}</div>
+        </div>
+        """
+        return verdict_html, hist_img, None, report_path, report_path
+
     color = "#dc2626" if verdict == "Cancer likely" else "#16a34a"
+
+    uncertainty_html = ""
+    if uncertainty is not None:
+        reliability = "Low" if uncertainty > 0.15 else ("Medium" if uncertainty > 0.05 else "High")
+        rel_color = {"Low": "#f87171", "Medium": "#fbbf24", "High": "#4ade80"}[reliability]
+        uncertainty_html = (
+            f"<div class='verdict-sub' style='margin-top:6px;'>"
+            f"Model uncertainty: {uncertainty:.3f} &nbsp;•&nbsp; "
+            f"Reliability: <span style='color:{rel_color};font-weight:700;'>{reliability}</span></div>"
+        )
+
+    warning_html = ""
+    if quality_warning:
+        warning_html = (
+            f"<div class='verdict-sub' style='margin-top:6px;color:#fbbf24;'>⚠ {quality_warning}</div>"
+        )
+
     verdict_html = f"""
     <div class="verdict-card" style="background:{color};">
       <div class="verdict-title">{verdict}</div>
       <div class="verdict-sub">Model output: {label} &nbsp;•&nbsp; Confidence: {confidence*100:.1f}%</div>
+      {uncertainty_html}
+      {warning_html}
     </div>
     """
 
@@ -393,6 +525,9 @@ def find_free_port(start_port=7860, end_port=7880):
 
 
 if __name__ == "__main__":
-    port = find_free_port(7860, 7880) or 7860
+    port = int(os.environ.get("PORT", "7860"))
+    # Render provides a dynamic port; keep local behavior as a fallback for development.
+    if port == 7860:
+        port = find_free_port(7860, 7880) or 7860
     print(f"Launching on port {port}")
-    demo.launch(server_name="127.0.0.1", server_port=port, debug=True, share=False, css=CSS)
+    demo.launch(server_name="0.0.0.0", server_port=port, debug=True, share=False, css=CSS)
