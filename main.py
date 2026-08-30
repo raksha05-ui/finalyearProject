@@ -123,11 +123,16 @@ def load_bundled_model(path: str = "model_cnn.pt") -> Optional[torch.nn.Module]:
 
 
 def _preprocess_for_model(pil_img: Image.Image):
+    # Must match the training-time transforms exactly (see training notebook,
+    # `test_transforms`): direct resize to 224x224 (no center-crop) and
+    # normalization with mean/std = 0.5/0.5/0.5, NOT ImageNet stats. Feeding
+    # ImageNet-normalized input here pushed the BatchNorm layers far outside
+    # the distribution they were calibrated on, which saturated the network
+    # into near-100%-confidence, same-class-every-time predictions.
     transform = T.Compose([
-        T.Resize(224),
-        T.CenterCrop(224),
+        T.Resize((224, 224)),
         T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
     return transform(pil_img).unsqueeze(0)
 
