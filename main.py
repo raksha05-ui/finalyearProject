@@ -32,6 +32,9 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 import socket
 
+# Environment flag: on Render free tier, skip expensive MC-Dropout for speed
+RENDER_FAST_MODE = os.getenv("RENDER_FAST_MODE", "").lower() == "true"
+
 
 # ---------------------------------------------------------------------------
 # Model
@@ -210,21 +213,25 @@ def mc_dropout_predict(model: torch.nn.Module, input_tensor: torch.Tensor, n_pas
 # ---------------------------------------------------------------------------
 
 def make_histogram(img: Image.Image):
+    """Lightweight histogram without matplotlib rendering."""
     gray = np.asarray(img.convert("L")).ravel()
-    fig, ax = plt.subplots(figsize=(4.5, 2.2), dpi=120)
-    fig.patch.set_facecolor("#0b1220")
-    ax.set_facecolor("#0b1220")
-    ax.hist(gray, bins=32, color="#60a5fa")
-    ax.set_title("Pixel intensity distribution", color="#e2e8f0", fontsize=10)
-    ax.tick_params(colors="#94a3b8", labelsize=8)
-    for spine in ax.spines.values():
-        spine.set_color("#334155")
-    fig.tight_layout()
-    fig.canvas.draw()
-    buf = np.asarray(fig.canvas.buffer_rgba())
-    out = Image.fromarray(buf).convert("RGB")
-    plt.close(fig)
-    return out
+    hist, bins = np.histogram(gray, bins=32, range=(0, 256))
+    
+    # Create a simple PIL-based histogram visualization (much faster than matplotlib)
+    hist_img = Image.new("RGB", (320, 180), color="#0b1220")
+    pixels = hist_img.load()
+    
+    max_hist = max(hist) if max(hist) > 0 else 1
+    bar_width = 10
+    
+    for i, h in enumerate(hist):
+        bar_height = int((h / max_hist) * 160)
+        x_start = i * bar_width
+        for x in range(x_start, min(x_start + bar_width, 320)):
+            for y in range(180 - bar_height, 180):
+                pixels[x, y] = (96, 165, 250)  # blue
+    
+    return hist_img
 
 
 def edge_saliency_overlay(img: Image.Image, alpha: float = 0.5):
@@ -322,13 +329,27 @@ def predict(image: np.ndarray, use_explanation: bool):
     if model is not None:
         try:
             input_t = _preprocess_for_model(pil)
-            # Keep MC-dropout lightweight for deployed environments; explanations
-            # are optional and should not run by default.
-            mean_probs, std_probs = mc_dropout_predict(model, input_t, n_passes=5)
+            
+            with torch.no_grad():  # Ensure no gradient computation
+                if RENDER_FAST_MODE:
+                    # Fast mode: single forward pass only, no MC-Dropout
+                    output = model(input_t)
+                    probs = F.softmax(output, dim=1)
+                    mean_probs = probs.squeeze(0)
+                    uncertainty = None
+                else:
+                    # Keep MC-dropout lightweight for deployed environments; explanations
+                    # are optional and should not run by default.
+                    mean_probs, std_probs = mc_dropout_predict(model, input_t, n_passes=2)
+                    uncertainty = float(std_probs[int(mean_probs.argmax().item())].item())
+            
             idx_t = int(mean_probs.argmax().item())
             label = "Benign" if idx_t == 0 else "Malignant"
             confidence = float(mean_probs[idx_t].item())
-            uncertainty = float(std_probs[idx_t].item())
+            
+            # Clear CUDA cache if available
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             if use_explanation:
                 cam = grad_cam(model, input_t)
@@ -350,7 +371,10 @@ def predict(image: np.ndarray, use_explanation: bool):
         explanation_img = edge_saliency_overlay(pil)
 
     verdict = "Cancer likely" if label == "Malignant" else "Cancer unlikely"
-    hist_img = make_histogram(pil)
+    
+    # Skip histogram on fast mode to save memory
+    hist_img = None if RENDER_FAST_MODE else make_histogram(pil)
+    
     report = make_report_text(verdict, label, confidence, uncertainty,
                                quality_reason if is_warning_only else "")
 
@@ -491,7 +515,7 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
     with gr.Row():
         with gr.Column(scale=1):
             image_input = gr.Image(label="Ultrasound image", type="numpy")
-            show_explanation = gr.Checkbox(label="Show visual explanation (highlighted regions)", value=False)
+            show_explanation = gr.Checkbox(label="Show visual explanation (highlighted regions)", value=False, visible=False)
             analyze_btn = gr.Button("Analyze", variant="primary")
             model_status = (
                 "Using trained CNN model (model_cnn.pt)."

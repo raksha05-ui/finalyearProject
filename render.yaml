@@ -14,4 +14,10 @@ services:
         value: "3.12.10"
       - key: PORT
         value: "10000"
+      - key: GRADIO_ANALYTICS_ENABLED
+        value: "False"
+      - key: RENDER_FAST_MODE
+        value: "true"
     healthCheckPath: /
+    preStartCommand: |
+      echo "Note: Free tier has limited CPU. First prediction may take 30-60 seconds."
