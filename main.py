@@ -109,6 +109,143 @@ def check_image_quality(img: Image.Image):
     return True, "", False
 
 
+def compute_image_quality_metrics(img: Image.Image) -> dict:
+    """Compute real, measured image-quality metrics for the uploaded image.
+
+    Every number here comes directly from the pixel data — nothing is a
+    placeholder or fabricated figure. Thresholds are documented heuristics
+    (consistent with check_image_quality above), not clinically validated
+    cutoffs, and are labeled as such in the UI.
+    """
+    width, height = img.size
+    gray = img.convert("L")
+    arr = np.asarray(gray, dtype=np.float32)
+    brightness = float(arr.mean())
+    contrast = float(arr.std())
+
+    # Blur via variance of the Laplacian: a well-known blur proxy — sharp
+    # images have high-variance edge response, blurry images have low
+    # variance because edges are smoothed out.
+    laplacian_kernel = [0, -1, 0, -1, 4, -1, 0, -1, 0]
+    lap_img = gray.filter(ImageFilter.Kernel((3, 3), laplacian_kernel, scale=1))
+    lap_arr = np.asarray(lap_img, dtype=np.float32)
+    blur_variance = float(lap_arr.var())
+
+    return {
+        "width": width,
+        "height": height,
+        "brightness": brightness,
+        "contrast": contrast,
+        "blur_variance": blur_variance,
+    }
+
+
+def evaluate_quality_checks(metrics: dict) -> dict:
+    """Turn raw metrics into pass/fail checks, a per-check 0-100 subscore,
+    and a composite confidence score (plain average of the four subscores —
+    a transparent combination of real measurements, not an invented number).
+    """
+    width, height = metrics["width"], metrics["height"]
+    brightness, contrast, blur_var = metrics["brightness"], metrics["contrast"], metrics["blur_variance"]
+
+    # Resolution: the model resizes to 224x224 regardless, so anything
+    # below that has to be upsampled and may lose detail.
+    min_dim = min(width, height)
+    res_ok = min_dim >= 224
+    res_score = min(100.0, 100.0 * min_dim / 224.0)
+
+    # Brightness: flag frames that are near-black or near-white (clipped).
+    bright_ok = 30.0 <= brightness <= 220.0
+    bright_score = max(0.0, 100.0 - 2.0 * max(0.0, 30.0 - brightness, brightness - 220.0))
+
+    # Contrast: reuse the same std-based thresholds as check_image_quality.
+    contrast_ok = contrast >= 20.0
+    contrast_score = min(100.0, 100.0 * contrast / 30.0)
+
+    # Blur: variance-of-Laplacian threshold. Heuristic, not clinically
+    # validated — scaled roughly against typical ultrasound frame sharpness.
+    blur_ok = blur_var >= 15.0
+    blur_score = min(100.0, 100.0 * blur_var / 40.0)
+
+    checks = {
+        "resolution": {"ok": res_ok, "score": res_score,
+                        "value": f"{width} × {height}"},
+        "brightness": {"ok": bright_ok, "score": bright_score,
+                        "value": "Normal" if bright_ok else ("Too dark" if brightness < 30 else "Too bright")},
+        "contrast": {"ok": contrast_ok, "score": contrast_score,
+                     "value": "Good" if contrast_ok else "Low"},
+        "blur": {"ok": blur_ok, "score": blur_score,
+                 "value": "Low" if blur_ok else "High"},
+    }
+
+    confidence = sum(c["score"] for c in checks.values()) / len(checks)
+    confidence = max(0.0, min(100.0, confidence))
+
+    if confidence >= 80:
+        readiness = "HIGH"
+    elif confidence >= 50:
+        readiness = "MEDIUM"
+    else:
+        readiness = "LOW"
+
+    overall_good = all(c["ok"] for c in checks.values())
+
+    return {
+        "checks": checks,
+        "confidence": confidence,
+        "readiness": readiness,
+        "overall_good": overall_good,
+    }
+
+
+def build_quality_panel_html(metrics: dict, evaluation: dict) -> str:
+    checks = evaluation["checks"]
+
+    def badge(ok):
+        return "<span style='color:#4ade80;'>✓ GOOD</span>" if ok else "<span style='color:#f87171;'>⚠ CHECK</span>"
+
+    reasons = []
+    if checks["resolution"]["ok"]:
+        reasons.append("Sufficient resolution for detecting visual patterns")
+    if checks["brightness"]["ok"]:
+        reasons.append("Brightness is within an acceptable range")
+    if checks["contrast"]["ok"]:
+        reasons.append("Good contrast helps distinguish the affected region")
+    if checks["blur"]["ok"]:
+        reasons.append("Low blur preserves important visual details")
+    if not reasons:
+        reasons.append("No quality checks passed — treat this result with caution")
+
+    reasons_html = "".join(f"<div class='quality-reason'>✓ {r}</div>" for r in reasons)
+
+    overall_label = "GOOD ✓" if evaluation["overall_good"] else "NEEDS ATTENTION ⚠"
+    readiness_color = {"HIGH": "#4ade80", "MEDIUM": "#fbbf24", "LOW": "#f87171"}[evaluation["readiness"]]
+
+    return f"""
+    <div class="quality-card">
+      <div class="quality-section-title">IMAGE QUALITY</div>
+      <div class="quality-row"><span>Resolution</span><span>{checks['resolution']['value']}</span>{badge(checks['resolution']['ok'])}</div>
+      <div class="quality-row"><span>Brightness</span><span>{checks['brightness']['value']}</span>{badge(checks['brightness']['ok'])}</div>
+      <div class="quality-row"><span>Contrast</span><span>{checks['contrast']['value']}</span>{badge(checks['contrast']['ok'])}</div>
+      <div class="quality-row"><span>Blur</span><span>{checks['blur']['value']}</span>{badge(checks['blur']['ok'])}</div>
+      <div class="quality-row" style="margin-top:6px;font-weight:700;"><span>Overall Quality</span><span></span><span>{overall_label}</span></div>
+
+      <div class="quality-section-title" style="margin-top:14px;">WHY THIS IMAGE IS SUITABLE</div>
+      {reasons_html}
+
+      <div class="quality-section-title" style="margin-top:14px;">XAI CONFIDENCE</div>
+      <div class="quality-row"><span>Image Quality Confidence</span><span></span><span>{evaluation['confidence']:.0f}%</span></div>
+      <div class="quality-row"><span>Analysis Readiness</span><span></span><span style="color:{readiness_color};font-weight:700;">{evaluation['readiness']}</span></div>
+      <div class="quality-note">
+        ⚠ Note: Explainable AI highlights image features that influenced the model's prediction.
+        It does not replace clinical diagnosis. Quality scores above are computed from this
+        image's own pixel statistics (resolution, brightness, contrast, blur) using documented
+        heuristic thresholds — they are not a clinically validated quality assessment.
+      </div>
+    </div>
+    """
+
+
 def load_bundled_model(path: str = "model_cnn.pt") -> Optional[torch.nn.Module]:
     if not os.path.exists(path):
         return None
@@ -573,6 +710,24 @@ html, body {
 .verdict-title { font-size: 1.4rem; font-weight: 800; margin-bottom: 6px; }
 .verdict-sub { font-size: 0.9rem; opacity: 0.9; }
 .footer-note { text-align:center; margin-top:16px; color: var(--muted); font-size: 0.85rem; }
+.quality-card {
+  border-radius: 18px; padding: 20px; background: #1e293b;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.25); margin-top: 16px;
+}
+.quality-section-title {
+  font-size: 0.8rem; font-weight: 800; letter-spacing: 0.06em;
+  color: #94a3b8; border-bottom: 1px solid #334155; padding-bottom: 6px; margin-bottom: 8px;
+}
+.quality-row {
+  display: flex; justify-content: space-between; gap: 12px;
+  font-size: 0.9rem; padding: 4px 0; color: #e2e8f0;
+}
+.quality-row span:first-child { color: #94a3b8; }
+.quality-reason { font-size: 0.85rem; color: #cbd5e1; padding: 3px 0; }
+.quality-note {
+  margin-top: 12px; font-size: 0.78rem; color: #fbbf24; opacity: 0.9;
+  border-top: 1px solid #334155; padding-top: 10px;
+}
 """
 
 
@@ -582,7 +737,7 @@ def analyze(image, show_explanation):
             "<div class='verdict-card' style='background:#334155;'>"
             "<div class='verdict-title'>No image uploaded</div>"
             "<div class='verdict-sub'>Please upload an ultrasound image first.</div></div>",
-            None, None, None, None,
+            None, None, None, None, "",
         )
 
     try:
@@ -599,7 +754,15 @@ def analyze(image, show_explanation):
           <div class="verdict-sub">{type(e).__name__}: {e}</div>
         </div>
         """
-        return error_html, None, None, None, None
+        return error_html, None, None, None, None, ""
+
+    # Quality panel is computed from the raw uploaded image's own pixel
+    # statistics, independent of model/prediction success — so it's shown
+    # even in the REJECTED path (it's often exactly what explains a rejection).
+    pil_for_quality = Image.fromarray(np.uint8(image)).convert("RGB")
+    q_metrics = compute_image_quality_metrics(pil_for_quality)
+    q_eval = evaluate_quality_checks(q_metrics)
+    quality_html = build_quality_panel_html(q_metrics, q_eval)
 
     if assessment == "REJECTED":
         verdict_html = f"""
@@ -608,7 +771,7 @@ def analyze(image, show_explanation):
           <div class="verdict-sub">{label}</div>
         </div>
         """
-        return verdict_html, hist_img, None, report_path, report_path
+        return verdict_html, hist_img, None, report_path, report_path, quality_html
 
     color_by_assessment = {
         "VERY LOW SUSPICION": "#15803d",
@@ -650,7 +813,7 @@ def analyze(image, show_explanation):
     </div>
     """
 
-    return verdict_html, hist_img, explanation_img, report_path, report_path
+    return verdict_html, hist_img, explanation_img, report_path, report_path, quality_html
 
 
 with gr.Blocks(title="Breast Screening Assistant") as demo:
@@ -696,6 +859,7 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
                 hist_out = gr.Image(label="Intensity histogram", show_label=True)
                 explanation_out = gr.Image(label="Highlighted regions", show_label=True)
             report_file = gr.File(label="Download report", visible=True)
+            quality_out = gr.HTML()
 
     gr.HTML(
         "<div class='footer-note'>"
@@ -707,7 +871,7 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
     analyze_btn.click(
         fn=analyze,
         inputs=[image_input, show_explanation],
-        outputs=[verdict_out, hist_out, explanation_out, report_file, report_file],
+        outputs=[verdict_out, hist_out, explanation_out, report_file, report_file, quality_out],
     )
 
 
