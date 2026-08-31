@@ -123,17 +123,44 @@ def load_bundled_model(path: str = "model_cnn.pt") -> Optional[torch.nn.Module]:
 
 
 def _preprocess_for_model(pil_img: Image.Image):
+    # Must match the training-time transforms exactly (see training notebook,
+    # `test_transforms`): direct resize to 224x224 (no center-crop) and
+    # normalization with mean/std = 0.5/0.5/0.5, NOT ImageNet stats. Feeding
+    # ImageNet-normalized input here pushed the BatchNorm layers far outside
+    # the distribution they were calibrated on, which saturated the network
+    # into near-100%-confidence, same-class-every-time predictions.
     transform = T.Compose([
-        T.Resize(224),
-        T.CenterCrop(224),
+        T.Resize((224, 224)),
         T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
     return transform(pil_img).unsqueeze(0)
 
 
+def _forward_to_logits(model: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Replicate the Classifier's forward pass but stop BEFORE log_softmax,
+    returning raw class logits. Grad-CAM must backprop from the raw class
+    score, not from log-probabilities — backpropping through log_softmax
+    distorts the gradient sign and can make the ReLU'd Grad-CAM weighted-sum
+    uniformly negative (i.e. a blank/zeroed heatmap), which is exactly what
+    was happening here before this fix."""
+    x = model.pool1(F.relu(model.batchn1(model.conv1(x))))
+    x = model.pool2(F.relu(model.batchn2(model.conv2(x))))
+    x = model.pool2(F.relu(model.batchn3(model.conv3(x))))
+    x = model.pool2(F.relu(model.batchn4(model.conv4(x))))
+    x = torch.flatten(x, 1)
+    x = model.dropout(F.relu(model.fc1(x)))
+    logits = model.fc2(x)
+    return logits
+
+
 def grad_cam(model: torch.nn.Module, input_tensor: torch.Tensor):
-    """Compute a Grad-CAM heatmap (H, W) in [0, 1] using the last conv layer."""
+    """Compute a Grad-CAM heatmap (H, W) in [0, 1] using the last conv layer.
+
+    Returns (cam, reason). cam is None on failure, with `reason` explaining
+    why (printed to console and shown to the user instead of silently
+    leaving the panel blank or substituting a non-Grad-CAM visualization).
+    """
     activation, gradient = None, None
 
     def forward_hook(_module, _inp, out):
@@ -145,13 +172,26 @@ def grad_cam(model: torch.nn.Module, input_tensor: torch.Tensor):
         gradient = grad_out[0].detach()
 
     target_layer = model.conv4 if hasattr(model, "conv4") else None
+    target_layer_name = "conv4"
     if target_layer is None:
-        for module in reversed(list(model.modules())):
+        target_layer_name = None
+        for name, module in reversed(list(model.named_modules())):
             if isinstance(module, torch.nn.Conv2d):
                 target_layer = module
+                target_layer_name = name
                 break
     if target_layer is None:
-        return None
+        print("[grad_cam] FAILED: no Conv2d layer found in model")
+        return None, "Target convolutional layer not found."
+
+    if not hasattr(model, "fc2"):
+        print("[grad_cam] FAILED: model does not match the expected "
+              "Classifier architecture (no fc2 head found)")
+        return None, "Unsupported model architecture."
+
+    print(f"[grad_cam] model architecture: {model.__class__.__name__}")
+    print(f"[grad_cam] target CAM layer: {target_layer_name}")
+    print(f"[grad_cam] input shape: {tuple(input_tensor.shape)}")
 
     fh = target_layer.register_forward_hook(forward_hook)
     if hasattr(target_layer, "register_full_backward_hook"):
@@ -159,26 +199,37 @@ def grad_cam(model: torch.nn.Module, input_tensor: torch.Tensor):
     else:
         bh = target_layer.register_backward_hook(backward_hook)
 
-    model.zero_grad()
-    output = model(input_tensor)
-    probs = F.softmax(output, dim=1)
-    target_class = int(probs.argmax(dim=1).item())
-    one_hot = torch.zeros_like(probs)
-    one_hot[0, target_class] = 1.0
-    output.backward(gradient=one_hot)
-
-    fh.remove()
-    bh.remove()
+    try:
+        model.zero_grad()
+        # Use raw logits (pre-log_softmax) for the backward pass — see
+        # _forward_to_logits docstring for why this matters.
+        logits = _forward_to_logits(model, input_tensor)
+        target_class = int(logits.argmax(dim=1).item())
+        print(f"[grad_cam] raw model output (logits): {logits.detach().cpu().numpy()}")
+        print(f"[grad_cam] predicted class: {target_class}")
+        logits[0, target_class].backward()
+    finally:
+        fh.remove()
+        bh.remove()
 
     if activation is None or gradient is None:
-        return None
+        print("[grad_cam] FAILED: gradient or activation is None "
+              "(model may be in inference-only mode or hooks did not fire)")
+        return None, "Gradient computation unavailable for this model."
 
     weights = gradient.mean(dim=(2, 3), keepdim=True)
     cam = F.relu((weights * activation).sum(dim=1, keepdim=True))
     cam = F.interpolate(cam, size=input_tensor.shape[2:], mode="bilinear", align_corners=False)
     cam = cam.squeeze().detach().cpu().numpy()
-    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-    return cam
+    cam_min, cam_max = float(cam.min()), float(cam.max())
+    print(f"[grad_cam] Grad-CAM tensor shape: {cam.shape}, "
+          f"heatmap min: {cam_min:.6f}, heatmap max: {cam_max:.6f}")
+    if cam_max - cam_min < 1e-6:
+        print("[grad_cam] WARNING: heatmap is (near-)uniform — activations "
+              "did not vary spatially for this input.")
+        return None, "Model attention was uniform across the image for this input."
+    cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
+    return cam, None
 
 
 def mc_dropout_predict(model: torch.nn.Module, input_tensor: torch.Tensor, n_passes: int = 5):
@@ -211,6 +262,36 @@ def mc_dropout_predict(model: torch.nn.Module, input_tensor: torch.Tensor, n_pas
 # ---------------------------------------------------------------------------
 # Visualization helpers
 # ---------------------------------------------------------------------------
+
+def render_message_image(message: str, size=(320, 220)) -> Image.Image:
+    """Render a plain message inside an image-sized panel, so the
+    'Highlighted regions' widget (a gr.Image) never has to be left silently
+    blank when Grad-CAM genuinely can't be produced for a real model."""
+    from PIL import ImageDraw, ImageFont
+    img = Image.new("RGB", size, color="#1e293b")
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    # naive word-wrap so the message fits inside the panel
+    words = message.split()
+    lines, current = [], ""
+    for w in words:
+        trial = (current + " " + w).strip()
+        if len(trial) > 34:
+            lines.append(current)
+            current = w
+        else:
+            current = trial
+    if current:
+        lines.append(current)
+    y = size[1] // 2 - (len(lines) * 14) // 2
+    for line in lines:
+        draw.text((14, y), line, fill="#fbbf24", font=font)
+        y += 16
+    return img
+
 
 def make_histogram(img: Image.Image):
     """Lightweight histogram without matplotlib rendering."""
@@ -260,7 +341,17 @@ def gradcam_overlay(img: Image.Image, cam: np.ndarray, alpha: float = 0.5):
     return Image.blend(img.convert("RGBA"), heat, alpha=alpha)
 
 
-def make_report_text(verdict: str, label: str, confidence: float,
+def _interpretation_for(assessment: str) -> str:
+    return {
+        "VERY LOW SUSPICION": "The model output is strongly consistent with a benign finding. This does NOT rule out cancer.",
+        "LOW SUSPICION / LIKELY BENIGN": "The model output is more consistent with a benign finding. This does NOT rule out cancer.",
+        "INTERMEDIATE / INDETERMINATE": "The model does not provide a sufficiently clear classification.",
+        "HIGH SUSPICION": "The model output is more concerning for malignancy.",
+        "VERY HIGH SUSPICION": "The model output strongly favors a malignant finding.",
+    }.get(assessment, "")
+
+
+def make_report_text(assessment: str, label: str, benign_prob: float, malignant_prob: float,
                       uncertainty: Optional[float] = None,
                       quality_note: str = "") -> str:
     now = datetime.now(timezone.utc).isoformat()
@@ -272,17 +363,48 @@ def make_report_text(verdict: str, label: str, confidence: float,
             f"Estimated reliability: {reliability}\n\n"
         )
     quality_line = f"Image quality note: {quality_note}\n\n" if quality_note else ""
+    interpretation = _interpretation_for(assessment)
     return (
-        "Breast Cancer Screening Report\n"
+        "AI Breast Ultrasound Screening Report\n"
         f"Generated: {now}\n\n"
-        f"Verdict: {verdict}\n"
-        f"Model output: {label}\n"
-        f"Confidence: {confidence * 100:.1f}%\n\n"
+        f"Assessment: {assessment}\n\n"
+        "Model probability (uncalibrated — not a validated clinical risk threshold):\n"
+        f"  Benign:    {benign_prob * 100:.1f}%\n"
+        f"  Malignant: {malignant_prob * 100:.1f}%\n\n"
+        f"Interpretation: {interpretation}\n\n"
         f"{uncertainty_line}"
         f"{quality_line}"
-        "Note: This is an automated screening aid, not a medical diagnosis.\n"
+        "Cancer stage cannot be determined from this AI ultrasound screening result.\n"
+        "Staging requires appropriate clinical evaluation and diagnostic testing.\n\n"
+        "AI screening result — not a medical diagnosis.\n"
+        "An AI result should not replace evaluation by a qualified healthcare professional.\n"
         "Please consult a qualified physician for any medical decision."
     )
+
+
+def classify_suspicion(malignant_prob: float) -> str:
+    """Map the model's raw malignant probability to a 5-level display label.
+
+    IMPORTANT: these are NOT clinically validated risk thresholds. No
+    calibration curve, ROC analysis, or held-out threshold-tuning results
+    exist anywhere in this project (checked the training notebook — every
+    validation-metric cell has empty output). These are simply evenly-spaced
+    bins over the model's own uncalibrated probability output, presented so
+    the UI reflects the model's actual varying confidence instead of
+    collapsing everything into a binary decision. The report/UI must always
+    show the raw percentages alongside this label, labeled as "model
+    probability" rather than a medical risk estimate.
+    """
+    if malignant_prob < 0.20:
+        return "VERY LOW SUSPICION"
+    elif malignant_prob < 0.40:
+        return "LOW SUSPICION / LIKELY BENIGN"
+    elif malignant_prob < 0.60:
+        return "INTERMEDIATE / INDETERMINATE"
+    elif malignant_prob < 0.80:
+        return "HIGH SUSPICION"
+    else:
+        return "VERY HIGH SUSPICION"
 
 
 # ---------------------------------------------------------------------------
@@ -308,28 +430,28 @@ def predict(image: np.ndarray, use_explanation: bool):
     # the input even resembles an ultrasound frame before trusting it.
     is_ok, quality_reason, is_warning_only = check_image_quality(pil)
 
-    label, confidence, uncertainty = None, None, None
+    label, benign_prob, malignant_prob, uncertainty = None, None, None, None
     explanation_img = None
 
     if not is_ok:
         # Reject outright: don't run the model, don't fabricate a verdict.
         hist_img = make_histogram(pil)
         report = (
-            "Breast Cancer Screening Report\n"
+            "AI Breast Ultrasound Screening Report\n"
             f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n"
-            "Verdict: REJECTED — input does not resemble an ultrasound scan\n"
+            "Assessment: REJECTED — input does not resemble an ultrasound scan\n"
             f"Reason: {quality_reason}\n\n"
             "No prediction was made. Please upload a genuine ultrasound image."
         )
         fd, report_path = tempfile.mkstemp(suffix=".txt", prefix="report_")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(report)
-        return "REJECTED", quality_reason, None, hist_img, None, report_path, None, ""
+        return "REJECTED", quality_reason, None, None, hist_img, None, report_path, None, ""
 
     if model is not None:
         try:
             input_t = _preprocess_for_model(pil)
-            
+
             with torch.no_grad():  # Ensure no gradient computation
                 if RENDER_FAST_MODE:
                     # Fast mode: single forward pass only, no MC-Dropout
@@ -342,47 +464,71 @@ def predict(image: np.ndarray, use_explanation: bool):
                     # are optional and should not run by default.
                     mean_probs, std_probs = mc_dropout_predict(model, input_t, n_passes=2)
                     uncertainty = float(std_probs[int(mean_probs.argmax().item())].item())
-            
-            idx_t = int(mean_probs.argmax().item())
+
+            # Class mapping from training: classes = ['benign', 'malignant']
+            # -> index 0 = benign, index 1 = malignant. Keep BOTH class
+            # probabilities (not just the winning one) so the UI/report can
+            # always show the actual model output rather than a collapsed
+            # single number.
+            benign_prob = float(mean_probs[0].item())
+            malignant_prob = float(mean_probs[1].item())
+            idx_t = 0 if benign_prob >= malignant_prob else 1
             label = "Benign" if idx_t == 0 else "Malignant"
-            confidence = float(mean_probs[idx_t].item())
-            
+
             # Clear CUDA cache if available
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
             if use_explanation:
-                cam = grad_cam(model, input_t)
+                cam, cam_fail_reason = grad_cam(model, input_t)
                 if cam is not None:
                     explanation_img = gradcam_overlay(pil, cam)
+                else:
+                    # Real trained model, but Grad-CAM genuinely failed —
+                    # show an honest message instead of silently swapping in
+                    # the generic edge-detection overlay (which would look
+                    # like a real Grad-CAM but isn't).
+                    explanation_img = render_message_image(
+                        f"Model attention map unavailable for this image/model. ({cam_fail_reason})"
+                    )
         except Exception:
             label = None  # fall through to heuristic
 
     if label is None:
-        # Heuristic fallback (no usable model available)
+        # Heuristic fallback (no usable model available). This is NOT the
+        # trained CNN — clearly distinguishable in the UI via model_status.
         arr = np.asarray(pil)
         mean_i, std_i = float(arr.mean()), float(arr.std())
         score = max(0.0, min(1.0, (140 - mean_i) / 100.0 + std_i / 255.0))
         label = "Malignant" if score >= 0.5 else "Benign"
-        confidence = float(max(0.5, min(0.99, 0.5 + abs(score - 0.5))))
+        malignant_prob = float(max(0.01, min(0.99, score)))
+        benign_prob = 1.0 - malignant_prob
         uncertainty = None
 
     if use_explanation and explanation_img is None:
+        # Only reached when no trained CNN was available at all (heuristic
+        # fallback path, label was reset to None above) — a real model's
+        # Grad-CAM failure is already handled above with an honest message,
+        # not this generic edge-detection substitute.
         explanation_img = edge_saliency_overlay(pil)
 
-    verdict = "Cancer likely" if label == "Malignant" else "Cancer unlikely"
-    
+    # 5-level suspicion tier derived directly from the model's own
+    # malignant-probability output (see classify_suspicion docstring for why
+    # this is NOT a clinically validated threshold set).
+    assessment = classify_suspicion(malignant_prob)
+
     # Skip histogram on fast mode to save memory
     hist_img = None if RENDER_FAST_MODE else make_histogram(pil)
-    
-    report = make_report_text(verdict, label, confidence, uncertainty,
+
+    report = make_report_text(assessment, label, benign_prob, malignant_prob, uncertainty,
                                quality_reason if is_warning_only else "")
 
     fd, report_path = tempfile.mkstemp(suffix=".txt", prefix="report_")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(report)
 
-    return verdict, label, confidence, hist_img, explanation_img, report_path, uncertainty, (quality_reason if is_warning_only else "")
+    return (assessment, label, benign_prob, malignant_prob, hist_img, explanation_img,
+            report_path, uncertainty, (quality_reason if is_warning_only else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -440,9 +586,8 @@ def analyze(image, show_explanation):
         )
 
     try:
-        verdict, label, confidence, hist_img, explanation_img, report_path, uncertainty, quality_warning = predict(
-            image, show_explanation
-        )
+        (assessment, label, benign_prob, malignant_prob, hist_img, explanation_img,
+         report_path, uncertainty, quality_warning) = predict(image, show_explanation)
     except Exception as e:
         # Catch anything unexpected so the UI shows a readable message
         # instead of every panel breaking into a generic "Error" state.
@@ -456,7 +601,7 @@ def analyze(image, show_explanation):
         """
         return error_html, None, None, None, None
 
-    if verdict == "REJECTED":
+    if assessment == "REJECTED":
         verdict_html = f"""
         <div class="verdict-card" style="background:#334155;">
           <div class="verdict-title">Image rejected</div>
@@ -465,7 +610,15 @@ def analyze(image, show_explanation):
         """
         return verdict_html, hist_img, None, report_path, report_path
 
-    color = "#dc2626" if verdict == "Cancer likely" else "#16a34a"
+    color_by_assessment = {
+        "VERY LOW SUSPICION": "#15803d",
+        "LOW SUSPICION / LIKELY BENIGN": "#16a34a",
+        "INTERMEDIATE / INDETERMINATE": "#d97706",
+        "HIGH SUSPICION": "#ea580c",
+        "VERY HIGH SUSPICION": "#dc2626",
+    }
+    color = color_by_assessment.get(assessment, "#334155")
+    interpretation = _interpretation_for(assessment)
 
     uncertainty_html = ""
     if uncertainty is not None:
@@ -485,10 +638,15 @@ def analyze(image, show_explanation):
 
     verdict_html = f"""
     <div class="verdict-card" style="background:{color};">
-      <div class="verdict-title">{verdict}</div>
-      <div class="verdict-sub">Model output: {label} &nbsp;•&nbsp; Confidence: {confidence*100:.1f}%</div>
+      <div class="verdict-title">AI Screening Result: {assessment}</div>
+      <div class="verdict-sub">Model probability &nbsp;•&nbsp; Benign: {benign_prob*100:.1f}% &nbsp;•&nbsp; Malignant: {malignant_prob*100:.1f}%</div>
+      <div class="verdict-sub" style="margin-top:6px;">{interpretation}</div>
       {uncertainty_html}
       {warning_html}
+      <div class="verdict-sub" style="margin-top:10px;font-size:0.8rem;opacity:0.85;">
+        AI screening result — not a medical diagnosis. Cancer stage cannot be determined from
+        this result. Please consult a qualified healthcare professional for clinical evaluation.
+      </div>
     </div>
     """
 
@@ -515,7 +673,14 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
     with gr.Row():
         with gr.Column(scale=1):
             image_input = gr.Image(label="Ultrasound image", type="numpy")
-            show_explanation = gr.Checkbox(label="Show visual explanation (highlighted regions)", value=False, visible=False)
+            # Root cause of the empty "Highlighted regions" panel: this toggle
+            # gated whether Grad-CAM ran at all, but was hidden AND defaulted
+            # to False, so `use_explanation` was always False and grad_cam()
+            # was never called. The Grad-CAM implementation itself (last conv
+            # layer, dynamic predicted-class target) was already correct.
+            # Kept hidden (no UI layout change) but now defaults to True so
+            # the panel is always populated.
+            show_explanation = gr.Checkbox(label="Show visual explanation (highlighted regions)", value=True, visible=False)
             analyze_btn = gr.Button("Analyze", variant="primary")
             model_status = (
                 "Using trained CNN model (model_cnn.pt)."
@@ -562,5 +727,31 @@ if __name__ == "__main__":
     # Render provides a dynamic port; keep local behavior as a fallback for development.
     if port == 7860:
         port = find_free_port(7860, 7880) or 7860
-    print(f"Launching on port {port}")
-    demo.launch(server_name="0.0.0.0", server_port=port, debug=True, share=False, css=CSS)
+
+    local_url = f"http://127.0.0.1:{port}"
+
+    print("=" * 50)
+    print("Breast Screening Assistant")
+    print("=" * 50)
+    print(f"Server running on: {local_url}")
+    print(f"Network binding:   0.0.0.0:{port}")
+    print("=" * 50)
+
+    # server_name stays 0.0.0.0 so the app is reachable on the local network /
+    # inside a container. inbrowser is deliberately False here — Gradio would
+    # otherwise try to open server_name (0.0.0.0) directly in the browser,
+    # which is a bind-any address, not a valid browser URL (ERR_ADDRESS_INVALID).
+    # We open the correct, routable 127.0.0.1 URL ourselves instead.
+    if not os.environ.get("RENDER"):
+        import threading
+        import time
+        import webbrowser
+
+        def _open_browser():
+            time.sleep(1.5)  # give the server a moment to start accepting connections
+            webbrowser.open(local_url)
+
+        threading.Thread(target=_open_browser, daemon=True).start()
+
+    demo.launch(server_name="0.0.0.0", server_port=port, debug=True, share=False,
+                inbrowser=False, css=CSS)
