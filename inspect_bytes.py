@@ -5,4 +5,3 @@ print('len=',len(b))
 print(b[:400])
 print(b[-200:])
 
-

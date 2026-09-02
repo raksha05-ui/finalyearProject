@@ -11,4 +11,3 @@ except SyntaxError as e:
         print('LINE:', e.text.rstrip())
     sys.exit(1)
 
-
