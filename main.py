@@ -53,6 +53,7 @@ import socket
 
 from pet_scan_module import analyze_pet_scan, pet_model_status_text
 from mammography_module import analyze_mammogram, mammography_model_status_text
+from mri_module import analyze_mri, mri_model_status_text
 
 RENDER_FAST_MODE = os.getenv("RENDER_FAST_MODE", "").lower() == "true"
 
@@ -1297,6 +1298,42 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
           fn=analyze_mammogram,
           inputs=[mammo_image_input],
           outputs=[mammo_verdict_out, mammo_explanation_out, mammo_report_file],
+      )
+
+     with gr.Tab("MRI Analysis"):
+
+      with gr.Row():
+
+        with gr.Column(scale=1):
+
+            mri_image_input = gr.Image(label="Breast MRI image", type="numpy")
+
+            mri_analyze_btn = gr.Button("Analyze MRI", variant="primary")
+
+            gr.HTML(
+                f"<div style='color:#94a3b8;font-size:0.85rem;margin-top:4px;'>"
+                f"{mri_model_status_text()}</div>"
+            )
+
+        with gr.Column(scale=1):
+
+            mri_verdict_out = gr.HTML()
+
+            mri_explanation_out = gr.Image(label="Highlighted regions (Grad-CAM)", show_label=True)
+
+            mri_report_file = gr.File(label="Download MRI report", visible=True)
+
+      gr.HTML(
+          "<div class='footer-note'>"
+          "AI-generated result for educational/research purposes only. "
+          "This is not a medical diagnosis."
+          "</div>"
+      )
+
+      mri_analyze_btn.click(
+          fn=analyze_mri,
+          inputs=[mri_image_input],
+          outputs=[mri_verdict_out, mri_explanation_out, mri_report_file],
       )
 
     gr.HTML(
