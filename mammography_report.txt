@@ -1,0 +1,15 @@
+Mammography Model Evaluation (held-out test set, n=493)
+Backbone: DenseNet169 (ImageNet pretrained, transfer learning)
+Task: binary classification using CBIS-DDSM 'pathology' labels
+Classes: 0=BENIGN (incl. BENIGN_WITHOUT_CALLBACK), 1=MALIGNANT
+
+Accuracy:  0.6329
+Precision: 0.5591
+Recall:    0.5123
+F1 score:  0.5347
+Confusion matrix (rows=true, cols=pred):
+[[208  82]
+ [ 99 104]]
+
+These numbers reflect this specific model's measured performance on this
+test split only — not a validated clinical accuracy claim.
