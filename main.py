@@ -51,7 +51,6 @@ import torchvision.transforms as T
 
 import socket
 
-from pet_scan_module import analyze_pet_scan, pet_model_status_text
 from mammography_module import analyze_mammogram, mammography_model_status_text
 from mri_module import analyze_mri, mri_model_status_text
 
@@ -1229,40 +1228,6 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
             report_file = gr.File(label="Download report", visible=True)
 
             quality_out = gr.HTML()
-
-     with gr.Tab("PET Scan Analysis"):
-
-      with gr.Row():
-
-        with gr.Column(scale=1):
-
-            pet_image_input = gr.Image(label="PET scan image", type="numpy")
-
-            pet_analyze_btn = gr.Button("Analyze PET Scan", variant="primary")
-
-            gr.HTML(
-                f"<div style='color:#94a3b8;font-size:0.85rem;margin-top:4px;'>"
-                f"{pet_model_status_text()}</div>"
-            )
-
-        with gr.Column(scale=1):
-
-            pet_verdict_out = gr.HTML()
-
-            pet_report_file = gr.File(label="Download PET report", visible=True)
-
-      gr.HTML(
-          "<div class='footer-note'>"
-          "AI-generated result for educational/research purposes only. "
-          "This is not a medical diagnosis."
-          "</div>"
-      )
-
-      pet_analyze_btn.click(
-          fn=analyze_pet_scan,
-          inputs=[pet_image_input],
-          outputs=[pet_verdict_out, pet_report_file],
-      )
 
      with gr.Tab("Mammography Analysis"):
 
