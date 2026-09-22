@@ -30,6 +30,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
+try:
+    from organ_detector import predict_organ, is_breast_label
+except Exception:
+    predict_organ = None
+    is_breast_label = None
 
 try:
     from torchvision.models import densenet201, DenseNet201_Weights
@@ -203,6 +208,72 @@ def predict_mri(image: np.ndarray):
         }
 
     pil = Image.fromarray(np.uint8(image)).convert("RGB")
+
+    # Enforce strict gating: organ detector if present + a strict MRI
+    # heuristic. Reject unconditionally if either indicates non-breast.
+    # Require organ_detector to be present to avoid accidental non-breast analysis.
+    if predict_organ is None:
+        fd, report_path = tempfile.mkstemp(suffix=".txt", prefix="mri_report_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("Breast MRI Analysis Report\n\n")
+            f.write("Assessment: REJECTED — organ detector not available on this installation.\n")
+            f.write("Place a trained 'organ_detector.pt' next to main.py to enable safe gating.\n")
+        return {
+            "label": "REJECTED - organ_detector missing",
+            "confidence": None,
+            "detail": "organ_detector not installed; analysis disabled to avoid non-breast predictions.",
+            "report_path": report_path,
+            "is_placeholder": True,
+            "explanation_img": None,
+        }
+
+    organ_label, organ_conf = ("unknown", 0.0)
+    try:
+        organ_label, organ_conf = predict_organ(pil)
+    except Exception:
+        organ_label, organ_conf = "unknown", 0.0
+
+    def is_strict_breast_mri(img: Image.Image) -> (bool, str):
+        gray = np.asarray(img.convert("L"), dtype=np.uint8)
+        h, w = gray.shape
+        tissue_frac = float((gray > 12).sum()) / (h * w)
+        if tissue_frac < 0.02:
+            return False, "Too little tissue-like area for a breast MRI."
+        if float(gray.std()) < 10.0:
+            return False, "Image contrast is too low for an MRI."
+        return True, ""
+
+    heuristic_ok, heuristic_reason = is_strict_breast_mri(pil)
+
+    if organ_conf >= 0.6 and organ_label != "mri":
+        fd, report_path = tempfile.mkstemp(suffix=".txt", prefix="mri_report_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("Breast MRI Analysis Report\n\n")
+            f.write("Rejected: uploaded image does not appear to be a breast MRI or breast image.\n")
+            f.write(f"Detected as: {organ_label} (confidence {organ_conf:.2f})\n")
+        return {
+            "label": "REJECTED - Not a breast MRI",
+            "confidence": None,
+            "detail": "Uploaded image does not appear to be a breast MRI or breast image.",
+            "report_path": report_path,
+            "is_placeholder": True,
+            "explanation_img": None,
+        }
+
+    if not heuristic_ok:
+        fd, report_path = tempfile.mkstemp(suffix=".txt", prefix="mri_report_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("Breast MRI Analysis Report\n\n")
+            f.write("Rejected: uploaded image does not appear to be a breast MRI or breast image.\n")
+            f.write(f"Reason: {heuristic_reason}\n")
+        return {
+            "label": "REJECTED - Not a breast MRI",
+            "confidence": None,
+            "detail": "Uploaded image does not appear to be a breast MRI or breast image.",
+            "report_path": report_path,
+            "is_placeholder": True,
+            "explanation_img": None,
+        }
     model, class_names = get_mri_model()
 
     explanation_img = None

@@ -53,6 +53,11 @@ import socket
 
 from mammography_module import analyze_mammogram, mammography_model_status_text
 from mri_module import analyze_mri, mri_model_status_text
+try:
+    from organ_detector import predict_organ, is_breast_label
+except Exception:
+    predict_organ = None
+    is_breast_label = None
 
 RENDER_FAST_MODE = os.getenv("RENDER_FAST_MODE", "").lower() == "true"
 
@@ -835,6 +840,82 @@ def predict(image: np.ndarray, use_explanation: bool):
             f.write(report)
 
         return "REJECTED", quality_reason, None, None, hist_img, None, report_path, None, ""
+
+    # Use organ_detector if available; regardless, require a strict
+    # ultrasound-specific heuristic to pass. If either check indicates a
+    # non-breast image, reject unconditionally (no permissive fallback).
+    # Require a trained `organ_detector.pt` to be present. This enforces
+    # that only images confirmed as breast modality are analyzed. If the
+    # detector is not installed, reject uploads to avoid accidental
+    # analysis of non-breast images.
+    if predict_organ is None:
+        hist_img = make_histogram(pil)
+        fd, report_path = tempfile.mkstemp(suffix=".txt", prefix="report_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("AI Breast Ultrasound Screening Report\n")
+            f.write(f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n")
+            f.write("Assessment: REJECTED — organ detector not available on this installation.\n")
+            f.write("To enable safe automatic gating (preventing non-breast analysis), place a trained 'organ_detector.pt' next to main.py.\n")
+        return "REJECTED", "organ_detector missing", None, None, hist_img, None, report_path, None, ""
+
+    organ_label, organ_conf = ("unknown", 0.0)
+    try:
+        organ_label, organ_conf = predict_organ(pil)
+    except Exception:
+        organ_label, organ_conf = "unknown", 0.0
+
+    def is_strict_breast_ultrasound(img: Image.Image) -> (bool, str):
+        gray = np.asarray(img.convert("L"), dtype=np.float32)
+        h, w = gray.shape
+        # require a non-trivial tissue fraction
+        tissue_frac = float((gray > 10).sum()) / (h * w)
+        if tissue_frac < 0.02:
+            return False, "Too little tissue-like area for a breast ultrasound."
+        if tissue_frac > 0.98:
+            return False, "Image is almost entirely uniform — unlikely ultrasound."
+        std = float(gray.std())
+        if std < 12.0 or std > 120.0:
+            return False, "Image contrast/variance outside expected ultrasound range."
+        # Check color spread to ensure near-grayscale
+        arr_rgb = np.asarray(img.convert("RGB"), dtype=np.float32)
+        r, g, b = arr_rgb[..., 0], arr_rgb[..., 1], arr_rgb[..., 2]
+        channel_spread = float(np.mean(np.abs(r - g)) + np.mean(np.abs(g - b)) + np.mean(np.abs(r - b)))
+        if channel_spread > 14.0:
+            return False, "Image has too much color to be an ultrasound."
+        bright_thresh = np.percentile(gray, 65)
+        ys = np.where(gray > bright_thresh)[0]
+        if ys.size == 0:
+            return False, "No bright tissue region detected."
+        center_y = float(ys.mean()) / h
+        if center_y < 0.05 or center_y > 0.95:
+            return False, "Tissue location atypical for a breast ultrasound image."
+        return True, ""
+
+    heuristic_ok, heuristic_reason = is_strict_breast_ultrasound(pil)
+
+    # Reject if organ detector confidently says it's not ultrasound
+    if organ_conf >= 0.6 and organ_label != "ultrasound":
+        hist_img = make_histogram(pil)
+        fd, report_path = tempfile.mkstemp(suffix=".txt", prefix="report_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("AI Breast Ultrasound Screening Report\n")
+            f.write(f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n")
+            f.write("Assessment: REJECTED — uploaded image does not appear to be a breast ultrasound.\n")
+            f.write(f"Detected as: {organ_label} (confidence {organ_conf:.2f})\n\n")
+            f.write("No prediction was made. Please upload a genuine breast ultrasound image.")
+        return "REJECTED", f"Detected as: {organ_label}", None, None, hist_img, None, report_path, None, ""
+
+    # Reject if strict heuristic fails
+    if not heuristic_ok:
+        hist_img = make_histogram(pil)
+        fd, report_path = tempfile.mkstemp(suffix=".txt", prefix="report_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("AI Breast Ultrasound Screening Report\n")
+            f.write(f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n")
+            f.write("Assessment: REJECTED — uploaded image does not appear to be a breast ultrasound.\n")
+            f.write(f"Reason: {heuristic_reason}\n\n")
+            f.write("No prediction was made. Please upload a genuine breast ultrasound image.")
+        return "REJECTED", heuristic_reason, None, None, hist_img, None, report_path, None, ""
 
     if model is not None:
 
