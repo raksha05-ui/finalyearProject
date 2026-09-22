@@ -53,7 +53,7 @@ DEFAULT_CLASS_NAMES = ["benign", "malignant"]  # fallback only; real run uses
 
 class MRIClassifier(nn.Module):
     """Same architecture as in train_mri_kaggle.py. Defined here (not
-    imported from main.py or the mammography module) to keep this module
+        imported from main.py or the mammography module) to keep this module
     fully independent."""
 
     def __init__(self, num_classes: int):
@@ -129,9 +129,10 @@ def mri_model_status_text() -> str:
     if os.path.exists(MRI_MODEL_PATH) and model is not None:
         return "Using trained DenseNet201 breast MRI model (mri_model.pt)."
     return (
-        "No trained breast MRI model connected yet — showing a placeholder "
-        "analysis only. Train one with train_mri_kaggle.py on Kaggle, then "
-        "add mri_model.pt next to main.py."
+           "No trained breast MRI model connected yet — showing a placeholder "
+           "analysis only. Run 'python train_mri_local.py' "
+           "from the project folder, then restart the app to enable real "
+           "predictions."
     )
 
 
@@ -306,9 +307,9 @@ def predict_mri(image: np.ndarray):
         detail = (
             "This module is ready to display and analyze breast MRI images, "
             "but no trained MRI model has been connected yet. No prediction "
-            "is being made on this image. Run train_mri_kaggle.py on Kaggle "
-            "and add the resulting mri_model.pt next to main.py to enable "
-            "real predictions."
+            "is being made on this image. Run 'python train_mri_local.py' "
+            "from the project folder, then restart the app to enable real "
+            "predictions."
         )
         is_placeholder = True
 
@@ -324,6 +325,7 @@ def predict_mri(image: np.ndarray):
         "AI-generated result for educational/research purposes only. "
         "This is not a medical diagnosis.",
     ]
+
     fd, report_path = tempfile.mkstemp(suffix=".txt", prefix="mri_report_")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write("\n".join(report_lines))
