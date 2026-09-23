@@ -20,7 +20,7 @@ from PIL import Image
 import torch
 import torchvision.transforms as T
 
-MODEL_PATH = "organ_detector.pt"
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "organ_detector.pt")
 _MODEL = None
 
 
@@ -68,7 +68,10 @@ def _preprocess(img: Image.Image) -> torch.Tensor:
         T.ToTensor(),
         T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
-    return transform(img.convert("RGB")).unsqueeze(0)
+    # Medical scans may be stored with a blue tint; the detector was trained
+    # on grayscale content, so remove display color before inference.
+    grayscale_rgb = img.convert("L").convert("RGB")
+    return transform(grayscale_rgb).unsqueeze(0)
 
 
 def predict_organ(pil_img: Image.Image) -> Tuple[str, float]:

@@ -47,8 +47,13 @@ except Exception:  # pragma: no cover
 # 1) MODEL DEFINITION (must match train_mammography_kaggle.py exactly)
 # ---------------------------------------------------------------------------
 
-MAMMOGRAPHY_MODEL_PATH = "mammography_model.pt"
+MAMMOGRAPHY_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "mammography_model.pt"
+)
 CLASS_NAMES = {0: "BENIGN", 1: "MALIGNANT"}  # real CBIS-DDSM dataset labels
+# Mammography is an allow-list input: uncertain modality predictions are
+# rejected before the mammography classifier is allowed to run.
+ORGAN_DETECTOR_MIN_CONFIDENCE = 0.75
 
 
 class MammographyClassifier(nn.Module):
@@ -141,7 +146,8 @@ def preprocess_mammogram(pil_img: Image.Image) -> torch.Tensor:
         T.ToTensor(),
         T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
-    return transform(pil_img.convert("RGB")).unsqueeze(0)
+    grayscale_rgb = pil_img.convert("L").convert("RGB")
+    return transform(grayscale_rgb).unsqueeze(0)
 
 
 # ---------------------------------------------------------------------------
@@ -263,25 +269,42 @@ def predict_mammogram(image: np.ndarray):
         tissue_frac = float((gray > 15).sum()) / (h * w)
         if tissue_frac < 0.02:
             return False, "Too little tissue-like area for a mammogram."
-        if float(gray.std()) < 12.0:
-            return False, "Image contrast is too low for a mammogram."
-        # Mammograms often show high dynamic range; reject very-uniform images
-        if float(gray.std()) < 8.0 or float(gray.std()) > 120.0:
-            return False, "Image contrast/variance outside expected mammogram range."
+        if tissue_frac > 0.98:
+            return False, "Image is almost entirely uniform — unlikely a mammogram."
+        # Mammograms may include large black borders or bright presentation
+        # windows, so only reject images that are genuinely near-uniform.
+        if float(gray.std()) < 6.0:
+            return False, "Image has almost no contrast/detail for a mammogram."
+        # Accept monochrome scans rendered with a blue tint, but reject images
+        # whose channels contain unrelated color information.
+        arr_rgb = np.asarray(img.convert("RGB"), dtype=np.float32)
+        r, g, b = arr_rgb[..., 0], arr_rgb[..., 1], arr_rgb[..., 2]
+        channel_spread = float(np.mean(np.abs(r - g)) + np.mean(np.abs(g - b)) + np.mean(np.abs(r - b)))
+        gray_flat = gray.astype(np.float32).reshape(-1)
+        channel_correlations = [
+            float(np.corrcoef(gray_flat, channel.reshape(-1))[0, 1])
+            for channel in (r, g, b)
+        ]
+        if channel_spread > 14.0 and min(channel_correlations) < 0.85:
+            return False, "Image has too much color to be a mammogram."
         return True, ""
 
     heuristic_ok, heuristic_reason = is_strict_mammogram(pil)
 
-    if organ_conf >= 0.6 and organ_label != "mammogram":
+    if organ_label != "mammogram" or organ_conf < ORGAN_DETECTOR_MIN_CONFIDENCE:
         fd, report_path = tempfile.mkstemp(suffix=".txt", prefix="mammography_report_")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("Mammography Analysis Report\n\n")
-            f.write("Rejected: uploaded image does not appear to be a mammogram or breast image.\n")
+            f.write("Rejected: organ detector did not confidently identify a mammogram.\n")
             f.write(f"Detected as: {organ_label} (confidence {organ_conf:.2f})\n")
         return {
             "label": "REJECTED - Not a mammogram",
             "confidence": None,
-            "detail": "Uploaded image does not appear to be a mammogram or breast image.",
+            "detail": (
+                "Organ detector result: "
+                f"{organ_label} ({organ_conf * 100:.1f}% confidence). "
+                "This image was not analyzed as a mammogram."
+            ),
             "report_path": report_path,
             "is_placeholder": True,
             "explanation_img": None,
@@ -293,10 +316,14 @@ def predict_mammogram(image: np.ndarray):
             f.write("Mammography Analysis Report\n\n")
             f.write("Rejected: uploaded image does not appear to be a mammogram or breast image.\n")
             f.write(f"Reason: {heuristic_reason}\n")
+            f.write(f"Organ detector: {organ_label} (confidence {organ_conf:.2f})\n")
         return {
             "label": "REJECTED - Not a mammogram",
             "confidence": None,
-            "detail": "Uploaded image does not appear to be a mammogram or breast image.",
+            "detail": (
+                f"Mammogram image checks failed: {heuristic_reason} "
+                f"Organ detector: {organ_label} ({organ_conf * 100:.1f}%)."
+            ),
             "report_path": report_path,
             "is_placeholder": True,
             "explanation_img": None,
@@ -318,7 +345,8 @@ def predict_mammogram(image: np.ndarray):
                 f"Model probabilities — BENIGN: {probs[0]*100:.1f}%, "
                 f"MALIGNANT: {probs[1]*100:.1f}%. Based on a DenseNet169 model "
                 f"fine-tuned on CBIS-DDSM full mammogram images; evaluate this "
-                f"against the reported test-set metrics before trusting it."
+                f"against the reported test-set metrics before trusting it. "
+                f"Organ detector (advisory): {organ_label} ({organ_conf * 100:.1f}%)."
             )
             is_placeholder = False
 

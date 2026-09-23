@@ -235,13 +235,41 @@ def predict_mri(image: np.ndarray):
         organ_label, organ_conf = "unknown", 0.0
 
     def is_strict_breast_mri(img: Image.Image) -> (bool, str):
-        gray = np.asarray(img.convert("L"), dtype=np.uint8)
+        gray = np.asarray(img.convert("L"), dtype=np.float32)
         h, w = gray.shape
-        tissue_frac = float((gray > 12).sum()) / (h * w)
+
+        # require a non-trivial, non-total tissue fraction (rejects near-blank
+        # and near-fully-saturated images alike)
+        tissue_frac = float((gray > 10).sum()) / (h * w)
         if tissue_frac < 0.02:
             return False, "Too little tissue-like area for a breast MRI."
-        if float(gray.std()) < 10.0:
-            return False, "Image contrast is too low for an MRI."
+        if tissue_frac > 0.98:
+            return False, "Image is almost entirely uniform — unlikely an MRI."
+
+        std = float(gray.std())
+        if std < 12.0 or std > 120.0:
+            return False, "Image contrast/variance outside expected MRI range."
+
+        # MRI slices are effectively grayscale even when saved as RGB —
+        # reject images with real color content (photos, skin, other scans
+        # rendered in color).
+        arr_rgb = np.asarray(img.convert("RGB"), dtype=np.float32)
+        r, g, b = arr_rgb[..., 0], arr_rgb[..., 1], arr_rgb[..., 2]
+        channel_spread = float(np.mean(np.abs(r - g)) + np.mean(np.abs(g - b)) + np.mean(np.abs(r - b)))
+        if channel_spread > 14.0:
+            return False, "Image has too much color to be an MRI scan."
+
+        # MRI slices typically show a roughly centered anatomical cross-section
+        # against a dark background, not a subject filling one edge of frame.
+        bright_thresh = np.percentile(gray, 65)
+        ys, xs = np.where(gray > bright_thresh)
+        if ys.size == 0:
+            return False, "No tissue-like region detected."
+        center_y = float(ys.mean()) / h
+        center_x = float(xs.mean()) / w
+        if center_y < 0.05 or center_y > 0.95 or center_x < 0.05 or center_x > 0.95:
+            return False, "Tissue location atypical for a breast MRI slice."
+
         return True, ""
 
     heuristic_ok, heuristic_reason = is_strict_breast_mri(pil)

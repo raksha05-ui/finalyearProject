@@ -1,0 +1,24 @@
+Organ/Modality Detector Evaluation (held-out test set, n=540)
+Classes: ['ultrasound', 'mammogram', 'mri', 'other']
+
+Accuracy: 0.9778
+Confusion matrix (rows=true, cols=pred), order = ['ultrasound', 'mammogram', 'mri', 'other']:
+[[178   0   2   0]
+ [  0 176   4   0]
+ [  0   6 174   0]
+ [  0   0   0   0]]
+
+              precision    recall  f1-score   support
+
+  ultrasound       1.00      0.99      0.99       180
+   mammogram       0.97      0.98      0.97       180
+         mri       0.97      0.97      0.97       180
+       other       1.00      1.00      1.00         0
+
+    accuracy                           0.98       540
+   macro avg       0.98      0.98      0.98       540
+weighted avg       0.98      0.98      0.98       540
+
+This gate is a coarse pre-filter, not a diagnostic model — it exists only
+to reject uploads that aren't a breast ultrasound/mammogram/MRI before they
+reach the actual prediction models.
