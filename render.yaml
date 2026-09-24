@@ -2,7 +2,7 @@ services:
   - type: web
     name: breast-screening-assistant
     env: python
-    plan: free
+    plan: starter
     region: oregon
     buildCommand: |
       python -m pip install --upgrade pip
@@ -19,5 +19,3 @@ services:
       - key: RENDER_FAST_MODE
         value: "true"
     healthCheckPath: /
-    preStartCommand: |
-      echo "Note: Free tier has limited CPU. First prediction may take 30-60 seconds."
