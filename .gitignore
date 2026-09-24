@@ -5,3 +5,4 @@ tools/
 train_mri_kaggle.py
 Breast_Cancer_Detection_with_CNN_and_Gradio.ipynb
 train_mammography_kaggle.py
+train_mri_local.py
