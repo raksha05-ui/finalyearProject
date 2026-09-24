@@ -33,7 +33,13 @@ from typing import Optional
 
 import numpy as np
 
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 import matplotlib
+
+matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 
@@ -1451,5 +1457,5 @@ if __name__ == "__main__":
 
         threading.Thread(target=_open_browser, daemon=True).start()
 
-    demo.launch(server_name="0.0.0.0", server_port=port, debug=True, share=False,
-                inbrowser=False, css=CSS)
+    demo.launch(server_name="0.0.0.0", server_port=port, debug=False, share=False,
+                inbrowser=False, show_error=False, css=CSS)
