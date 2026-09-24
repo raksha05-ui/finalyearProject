@@ -2,7 +2,7 @@ services:
   - type: web
     name: breast-screening-assistant
     env: python
-    plan: starter
+    plan: free
     region: oregon
     buildCommand: |
       python -m pip install --upgrade pip
