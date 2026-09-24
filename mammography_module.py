@@ -123,8 +123,11 @@ def get_mammography_model() -> Optional[nn.Module]:
 
 
 def mammography_model_status_text() -> str:
-    if os.path.exists(MAMMOGRAPHY_MODEL_PATH) and get_mammography_model() is not None:
-        return "Using trained DenseNet169 mammography model (mammography_model.pt)."
+    if os.path.exists(MAMMOGRAPHY_MODEL_PATH):
+        return (
+            "Model file detected (mammography_model.pt). It will be loaded only "
+            "when you run a mammography analysis."
+        )
     return (
         "No trained mammography model connected yet — showing a placeholder "
         "analysis only. Train one with train_mammography_kaggle.py on Kaggle, "

@@ -125,9 +125,11 @@ def get_mri_model():
 
 
 def mri_model_status_text() -> str:
-    model, _ = get_mri_model()
-    if os.path.exists(MRI_MODEL_PATH) and model is not None:
-        return "Using trained DenseNet201 breast MRI model (mri_model.pt)."
+    if os.path.exists(MRI_MODEL_PATH):
+        return (
+            "Model file detected (mri_model.pt). It will be loaded only when "
+            "you run an MRI analysis."
+        )
     return (
            "No trained breast MRI model connected yet — showing a placeholder "
            "analysis only. Run 'python train_mri_local.py' "
