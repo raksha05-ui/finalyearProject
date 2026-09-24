@@ -959,7 +959,7 @@ def predict(image: np.ndarray, use_explanation: bool):
 
                 torch.cuda.empty_cache()
 
-            if use_explanation:
+            if use_explanation and not RENDER_FAST_MODE:
 
                 cam, cam_fail_reason = grad_cam(model, input_t)
 
@@ -996,6 +996,10 @@ def predict(image: np.ndarray, use_explanation: bool):
     if use_explanation and explanation_img is None:
 
         explanation_img = edge_saliency_overlay(pil)
+
+    if RENDER_FAST_MODE and not use_explanation:
+
+        explanation_img = None
 
     assessment = classify_suspicion(malignant_prob)
 
@@ -1289,7 +1293,11 @@ with gr.Blocks(title="Breast Screening Assistant") as demo:
 
             image_input = gr.Image(label="Ultrasound image", type="numpy")
 
-            show_explanation = gr.Checkbox(label="Show visual explanation (highlighted regions)", value=True, visible=False)
+            show_explanation = gr.Checkbox(
+                label="Show visual explanation (highlighted regions)",
+                value=(not RENDER_FAST_MODE),
+                visible=False,
+            )
 
             analyze_btn = gr.Button("Analyze", variant="primary")
 
